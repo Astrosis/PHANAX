@@ -329,44 +329,220 @@ def parse_args():
 # 1. LOAD & MERGE
 # ═══════════════════════════════════════════════════════════════════════
 
-def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
-    print("\n[1/8] Loading and merging inputs...")
+def _normalise_keyword(s: str) -> str:
+    """
+    Robust keyword normalisation for reliable joining.
+    Handles: mixed case, extra whitespace, smart quotes, unicode punctuation,
+    trailing punctuation, and common encoding artifacts.
+    """
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.lower().strip()
+    # Replace smart quotes and curly apostrophes
+    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    s = s.replace("\u201c", '"').replace("\u201d", '"')
+    # Collapse multiple spaces/tabs
+    s = re.sub(r"\s+", " ", s)
+    # Remove trailing punctuation that GSC sometimes appends
+    s = s.rstrip(".,;:")
+    return s
 
-    # ── Keywords
-    kw = pd.read_csv(kw_path)
+
+# ═══════════════════════════════════════════════════════════════════════
+# KEYWORD FILTER
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Add terms to filter out here. Three filter types:
+#
+# BRAND_TERMS   — exact brand names and common misspellings.
+#                 Any keyword CONTAINING one of these strings is removed.
+#                 All matching is case-insensitive after normalisation.
+#
+# NAVIGATIONAL  — site names, databases, tools people navigate to directly.
+#                 Same substring match logic as BRAND_TERMS.
+#
+# REGEX_FILTERS — full regex patterns for anything more complex
+#                 (e.g. product codes, catalog numbers, email addresses).
+#
+# To add more: just append to the relevant list.
+# ─────────────────────────────────────────────────────────────────────
+
+BRAND_TERMS = [
+    # Abcam and misspellings
+    "abcam", "abcamm", "abcam's", "abcamn", "ab cam",
+    # Add competitor brands below as you find them:
+    # "thermo fisher", "thermofisher", "thermosfisher",
+    # "cell signaling", "cst antibody",
+    # "biolegend", "bio-legend",
+    # "miltenyi", "milteny",
+    # "r&d systems", "r and d systems",
+    # "santa cruz", "santacruz",
+]
+
+NAVIGATIONAL_TERMS = [
+    # Databases and portals people search by name
+    "pubmed", "ncbi", "uniprot", "ensembl", "kegg", "reactome",
+    "gene ontology", "gene cards", "genecards",
+    "clinicaltrials.gov", "clinical trials gov",
+    "pdb", "rcsb",
+    # Add more as needed:
+    # "string db", "biogrid", "intact",
+]
+
+REGEX_FILTERS = [
+    # Product/catalog codes: letters + 4+ digits e.g. ab12345, PA5-12345
+    r"^[a-z]{1,4}[\-]?\d{4,}$",
+    # Pure numeric strings
+    r"^\d+$",
+    # Email addresses
+    r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",
+    # Add more patterns as needed:
+    # r"^lot\s+\d+",          # lot numbers
+    # r"cas\s+\d+[\-]\d+",    # CAS registry numbers
+]
+
+# Compile regex filters once at import time
+_COMPILED_REGEX = [re.compile(p) for p in REGEX_FILTERS]
+
+
+def _should_filter_keyword(kw: str) -> tuple[bool, str]:
+    """
+    Returns (True, reason) if keyword should be filtered, (False, "") otherwise.
+    kw must already be normalised (lowercase, stripped).
+    """
+    # Brand/navigational substring match
+    for term in BRAND_TERMS:
+        if term in kw:
+            return True, f"brand: '{term}'"
+
+    for term in NAVIGATIONAL_TERMS:
+        if term in kw:
+            return True, f"navigational: '{term}'"
+
+    # Regex patterns
+    for pattern in _COMPILED_REGEX:
+        if pattern.search(kw):
+            return True, f"pattern: {pattern.pattern}"
+
+    return False, ""
+
+
+def apply_keyword_filter(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Apply all keyword filters to a dataframe with a 'keyword' column.
+    Logs what was removed and why.
+    """
+    before = len(df)
+
+    filter_results = df["keyword"].apply(_should_filter_keyword)
+    filtered_mask  = filter_results.apply(lambda x: x[0])
+    reasons        = filter_results.apply(lambda x: x[1])
+
+    removed = df[filtered_mask].copy()
+    kept    = df[~filtered_mask].copy()
+
+    if verbose and len(removed) > 0:
+        reason_counts = reasons[filtered_mask].value_counts()
+        print(f"    → Filtered {len(removed):,} keywords ({before - len(removed):,} remain)")
+        print("    → Filter breakdown:")
+        for reason, count in reason_counts.head(10).items():
+            print(f"         {count:>5}  {reason}")
+        if len(removed) <= 20:
+            print(f"    → Removed: {', '.join(removed['keyword'].tolist())}")
+        else:
+            print(f"    → Sample removed: "
+                  f"{', '.join(removed['keyword'].head(10).tolist())} ...")
+    elif verbose:
+        print(f"    → No keywords filtered ({before:,} remain)")
+
+    return kept
+
+
+
+    print("\n[1/10] Loading and merging inputs...")
+
+    # ── Keywords (GSC data — contains impressions, clicks, position)
+    kw = pd.read_csv(kw_path, dtype=str)   # read as str first — avoids numeric coercion
     if kw_col not in kw.columns:
         raise ValueError(f"Column '{kw_col}' not found in keywords file. "
                          f"Available: {list(kw.columns)}")
     kw = kw.rename(columns={kw_col: "keyword"})
-    kw["keyword"] = kw["keyword"].str.strip().str.lower()
+    kw["keyword"]     = kw["keyword"].apply(_normalise_keyword)
+    kw["keyword_raw"] = kw["keyword"]   # keep for diagnostics
     kw = kw.drop_duplicates("keyword").reset_index(drop=True)
-    print(f"    → {len(kw)} keywords loaded")
+
+    # ── Apply keyword filter (brands, navigational, product codes)
+    print("    → Applying keyword filters...")
+    kw = apply_keyword_filter(kw, verbose=True)
+
+    # Coerce numeric columns NOW before merge so we don't lose them
+    for col, default in [("impressions", 0), ("clicks", 0),
+                          ("position", 999.0), ("volume", 0)]:
+        if col in kw.columns:
+            kw[col] = pd.to_numeric(kw[col], errors="coerce").fillna(default)
+        else:
+            kw[col] = default
+
+    print(f"    → {len(kw):,} keywords loaded")
+    print(f"    → GSC coverage: "
+          f"{(kw['impressions'] > 0).sum():,} with impressions, "
+          f"{(kw['impressions'] == 0).sum():,} with zero impressions")
 
     # ── SERP data
-    serp = pd.read_csv(serp_path)
+    serp = pd.read_csv(serp_path, dtype=str)
     serp.columns = [c.strip().lower().replace(" ", "_") for c in serp.columns]
 
-    # Normalise keyword column — try common names
     for candidate in ("keyword", "query", "search_term", "term"):
         if candidate in serp.columns:
             serp = serp.rename(columns={candidate: "keyword"})
             break
-    serp["keyword"] = serp["keyword"].str.strip().str.lower()
+
+    if "keyword" not in serp.columns:
+        raise ValueError(f"No keyword column found in SERP file. "
+                         f"Available: {list(serp.columns)}")
+
+    serp["keyword"] = serp["keyword"].apply(_normalise_keyword)
     serp = serp.drop_duplicates("keyword").reset_index(drop=True)
-    print(f"    → {len(serp)} SERP rows loaded")
+    print(f"    → {len(serp):,} SERP rows loaded")
 
-    # ── Merge on keyword (left = keep all keywords)
+    # ── Diagnose join overlap BEFORE merging
+    kw_set   = set(kw["keyword"])
+    serp_set = set(serp["keyword"])
+    overlap  = kw_set & serp_set
+    kw_only  = kw_set - serp_set
+    serp_only= serp_set - kw_set
+
+    print(f"\n    Join diagnostics:")
+    print(f"      ✓ {len(overlap):,} keywords match in both files")
+    print(f"      ✗ {len(kw_only):,} keywords in GSC with no SERP data")
+    print(f"      ~ {len(serp_only):,} SERP keywords not in GSC list")
+
+    if len(overlap) == 0:
+        print("\n    ⚠️  WARNING: Zero keyword overlap — check column names and encoding.")
+        print(f"      GSC sample:  {list(kw['keyword'])[:5]}")
+        print(f"      SERP sample: {list(serp['keyword'])[:5]}")
+    elif len(overlap) < len(kw_set) * 0.5:
+        print(f"\n    ⚠️  WARNING: Only {len(overlap)/len(kw_set)*100:.0f}% match rate.")
+        print(f"      GSC sample:  {list(kw['keyword'])[:3]}")
+        print(f"      SERP sample: {list(serp['keyword'])[:3]}")
+
+    # ── Merge — left join keeps all GSC keywords
     df = kw.merge(serp, on="keyword", how="left")
-    print(f"    → {len(df)} rows after merge "
-          f"({df['title_1'].notna().sum() if 'title_1' in df.columns else 0} with SERP data)")
 
-    # ── Ensure expected GSC columns exist with sensible defaults
-    for col, default in [("impressions", 0), ("clicks", 0),
-                          ("position", 999), ("volume", 0)]:
-        if col not in df.columns:
-            df[col] = default
-        else:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+    # ── Verify impressions survived the merge
+    with_impressions_before = (kw["impressions"] > 0).sum()
+    with_impressions_after  = (df["impressions"] > 0).sum()
+    if with_impressions_after < with_impressions_before * 0.95:
+        print(f"\n    ⚠️  Impression loss detected: "
+              f"{with_impressions_before:,} → {with_impressions_after:,} after merge. "
+              f"Check for duplicate keywords in keywords.csv causing row multiplication.")
+
+    serp_col_check = "title_1" if "title_1" in df.columns else \
+                     ("enriched_text" if "enriched_text" in df.columns else None)
+    n_with_serp = df[serp_col_check].notna().sum() if serp_col_check else 0
+    print(f"\n    → {len(df):,} rows after merge | "
+          f"{n_with_serp:,} with SERP data | "
+          f"{(df['impressions'] > 0).sum():,} with impressions")
 
     return df
 
@@ -695,13 +871,23 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
         0.0
     )
 
-    # ── Absence gap: zero GSC impressions
-    df["gap_absence"] = df["impressions"] == 0
+    # ── Absence gap: truly no content presence
+    # position == 999 means keyword never appeared in GSC at all
+    # (our default for keywords with no GSC data after merge)
+    # Zero impressions alone is NOT absence — GSC sometimes shows position
+    # for keywords with 0 impressions due to aggregation thresholds
+    df["gap_absence"] = df["position"] >= 999
 
-    # ── Performance gap: visible but underperforming
+    # ── Performance gap: Google knows you exist but you're losing
+    # Covers: ranking 11-100, OR visible but CTR too low to matter
     df["gap_performance"] = (
-        (df["impressions"] > 0) &
-        ((df["position"] > 10) | (df["ctr"] < 0.02))
+        (df["position"] < 999) &           # GSC has seen you for this keyword
+        (df["position"] > 10) |            # but you're off page 1
+        (
+            (df["impressions"] > 0) &      # OR you're getting impressions
+            (df["ctr"] < 0.02) &           # but very low CTR
+            (df["position"] <= 10)         # even though you're on page 1
+        )
     )
 
     # ── Format gap: SERP rewards accessible formats (guide/overview)
@@ -967,7 +1153,8 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════
 
 def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
-                    briefs_html: str = "", serp_gaps_html: str = ""):
+                    briefs_html: str = "", serp_gaps_html: str = "",
+                    visibility_html: str = ""):
     print("\n    → Generating HTML report...")
 
     # ── Scatter coloured by research area
@@ -1120,6 +1307,14 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
   {briefs_html}
 
   {serp_gaps_html}
+
+  <h2>📈 Visibility Improvement Stages</h2>
+  <p style='font-size:0.87em;color:#555;margin:0 0 20px 0'>
+    The following analyses focus on moving existing and new content from
+    page 2 to page 1 — covering intent alignment, fast optimisation wins,
+    freshness priorities, and internal linking structure.
+  </p>
+  {visibility_html}
 
   <p style="margin-top:40px;color:#aaa;font-size:0.78em">
     Model: all-MiniLM-L6-v2 &nbsp;|&nbsp;
@@ -2199,6 +2394,701 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
     return gaps_df, serp_gaps_html
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 11. SEARCH INTENT CLASSIFIER
+# ═══════════════════════════════════════════════════════════════════════
+
+INTENT_PATTERNS = {
+    "informational": [
+        r"\b(what is|what are|how does|how do|why does|why is|explain|"
+        r"mechanism|overview|introduction|definition|understand|learn|"
+        r"review|guide|tutorial|biology|pathway|function|role of)\b"
+    ],
+    "commercial": [
+        r"\b(best|top|compare|vs\.?|versus|comparison|alternative|"
+        r"recommend|rated|ranking|review of|which is better|choose)\b"
+    ],
+    "transactional": [
+        r"\b(buy|purchase|order|price|cost|kit|panel|reagent|antibody|"
+        r"catalog|supplier|manufacturer|protocol kit|assay kit|"
+        r"recombinant|conjugated|custom)\b"
+    ],
+    "clinical": [
+        r"\b(clinical trial|phase [123]|patient|treatment|therapy|"
+        r"diagnosis|prognosis|biomarker|efficacy|safety|dose|dosing|"
+        r"indication|fda approved|ema approved|guideline|standard of care)\b"
+    ],
+    "navigational": [
+        r"\b(ncbi|pubmed|uniprot|ensembl|pdb|kegg|reactome|"
+        r"abcam|thermo|sigma|bio-techne|r&d systems|biolegend)\b"
+    ],
+}
+
+def classify_intent(text: str) -> str:
+    """Classify search intent from keyword or title text."""
+    text = text.lower()
+    scores = {}
+    for intent, patterns in INTENT_PATTERNS.items():
+        score = sum(len(re.findall(p, text)) for p in patterns)
+        scores[intent] = score
+    top = max(scores, key=scores.get)
+    return top if scores[top] > 0 else "informational"
+
+
+def run_intent_classification(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stage 11: Classify search intent for every keyword.
+
+    Why this matters for page 1-2 visibility:
+    If your content is informational but the SERP is 80% transactional,
+    Google will not rank you there regardless of content quality.
+    This flags those structural mismatches so you don't waste resource.
+
+    Outputs:
+      keyword_intent    — dominant intent of the search query
+      serp_intent       — dominant intent of top-ranking titles
+      intent_mismatch   — True if keyword and SERP intents diverge
+      intent_note       — human-readable explanation of the mismatch
+    """
+    print("\n[11] Classifying search intent...")
+
+    # Classify keyword intent
+    df["keyword_intent"] = df["keyword"].apply(classify_intent)
+
+    # Classify SERP intent from titles
+    title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
+
+    def serp_intent_from_titles(row):
+        titles = " ".join(
+            str(row.get(c, "")) for c in title_cols[:5]
+            if pd.notna(row.get(c))
+        )
+        if "enriched_text" in row.index and "|" in str(row.get("enriched_text", "")):
+            titles = " ".join(str(row["enriched_text"]).split("|")[1:6])
+        return classify_intent(titles) if titles.strip() else "unknown"
+
+    df["serp_intent"] = df.apply(serp_intent_from_titles, axis=1)
+
+    # Flag mismatches
+    df["intent_mismatch"] = (
+        (df["serp_intent"] != "unknown") &
+        (df["keyword_intent"] != df["serp_intent"])
+    )
+
+    def intent_note(row):
+        if not row["intent_mismatch"]:
+            return ""
+        ki, si = row["keyword_intent"], row["serp_intent"]
+        notes = {
+            ("informational", "transactional"):
+                "SERP is product/commercial — informational content unlikely to rank here",
+            ("informational", "clinical"):
+                "SERP favours clinical evidence pages — content needs trial data & citations",
+            ("commercial", "informational"):
+                "SERP is educational — product-focused content won't rank",
+            ("transactional", "informational"):
+                "SERP rewards explainer content — pure product pages won't rank",
+            ("informational", "navigational"):
+                "SERP is database/tool navigation — not rankable with editorial content",
+        }
+        return notes.get((ki, si),
+            f"Intent shift: your content is {ki}, SERP rewards {si}")
+
+    df["intent_note"] = df.apply(intent_note, axis=1)
+
+    n_mismatch = df["intent_mismatch"].sum()
+    print(f"    → {n_mismatch:,} intent mismatches detected "
+          f"({n_mismatch/len(df)*100:.1f}% of keywords)")
+
+    intent_dist = df["keyword_intent"].value_counts()
+    print("    → Intent distribution:")
+    for intent, cnt in intent_dist.items():
+        bar = "█" * min(30, cnt * 30 // len(df))
+        print(f"      {intent:<16} {cnt:>5}  {bar}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 12. PAGE 2 FAST-WIN IDENTIFIER
+# ═══════════════════════════════════════════════════════════════════════
+
+def find_page2_fast_wins(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
+    """
+    Stage 12: Identify keywords ranking 11-20 (page 2) where small
+    content improvements could flip to page 1.
+
+    These are your highest-ROI optimisation opportunities:
+    - Content clearly exists (Google has indexed and ranked it)
+    - You're close — position 11-20, not position 50+
+    - Specific, actionable edits can push you over
+
+    For each fast-win keyword, output:
+      - What PAA questions are being asked that you may not answer
+      - What format the top results use (that yours may not match)
+      - Whether there's a snippet to win
+      - Specific optimisation actions ranked by impact
+
+    Grouped by cluster so optimisation briefs address multiple
+    related keywords in one content edit.
+    """
+    print("\n[12] Identifying page 2 fast-wins...")
+
+    # Page 2: position 11-20, has impressions (confirmed Google presence)
+    page2 = df[
+        (df["position"] >= 11) &
+        (df["position"] <= 20) &
+        (df["impressions"] > 0) &
+        (df["research_area"] != "Unclassified / General Methods")
+    ].copy()
+
+    if len(page2) == 0:
+        print("    → No page 2 keywords found")
+        return pd.DataFrame()
+
+    print(f"    → {len(page2):,} keywords on page 2 across "
+          f"{page2['research_area'].nunique()} research areas")
+
+    # Group by cluster for shared optimisation briefs
+    fast_wins = []
+
+    for (area, cluster), group in page2.groupby(
+        ["research_area", "cluster_label"]
+    ):
+        if len(group) < 1:
+            continue
+
+        # PAA questions unanswered (gap_paa flagged)
+        paa_needed = []
+        for paa_str in group["paa_questions"].dropna():
+            for q in str(paa_str).split("|"):
+                q = q.strip()
+                if q and len(q) > 8 and q not in paa_needed:
+                    paa_needed.append(q)
+
+        # Format signal
+        fmt_counts  = group["dominant_format"].value_counts()
+        serp_format = fmt_counts.index[0] if len(fmt_counts) else "unknown"
+
+        # Snippet opportunity
+        snippet_opp = bool(group.get("gap_snippet", pd.Series(False)).any())
+
+        # Intent alignment
+        intent_issues = group[group["intent_mismatch"]]["intent_note"].unique().tolist() \
+                        if "intent_mismatch" in group.columns else []
+
+        # Best position in cluster (closest to page 1)
+        best_pos  = group["position"].min()
+        avg_pos   = group["position"].mean()
+        total_imp = group["impressions"].sum()
+        top_kw    = group.sort_values("impressions", ascending=False)["keyword"].iloc[0]
+
+        # Build prioritised action list
+        actions = []
+        if paa_needed:
+            actions.append(
+                f"Add a FAQ or dedicated section answering: "
+                f"{'; '.join(paa_needed[:3])}"
+            )
+        if serp_format in ("guide", "overview") and not any(
+            w in cluster.lower() for w in ["guide", "overview", "how", "what"]
+        ):
+            actions.append(
+                f"Restructure as a {serp_format} — SERP rewards this format here"
+            )
+        if snippet_opp:
+            actions.append(
+                "Add a concise 40-60 word direct-answer paragraph near the top "
+                "targeting the featured snippet"
+            )
+        if intent_issues:
+            actions.append(f"Intent note: {intent_issues[0]}")
+        if not actions:
+            actions.append(
+                "Deepen content coverage — add more specific sub-topics, "
+                "mechanisms, or supporting data to match SERP depth"
+            )
+
+        # Win score: closer to p1 + higher impressions = better
+        win_score = (
+            ((20 - avg_pos) / 10) * 0.6 +
+            min(1.0, total_imp / 1000) * 0.4
+        )
+
+        fast_wins.append({
+            "win_score":          round(win_score, 3),
+            "research_area":      area,
+            "cluster":            cluster,
+            "keyword_count":      len(group),
+            "best_position":      round(best_pos, 1),
+            "avg_position":       round(avg_pos, 1),
+            "total_impressions":  int(total_imp),
+            "primary_keyword":    top_kw,
+            "all_keywords":       " | ".join(
+                group.sort_values("impressions", ascending=False)
+                ["keyword"].head(10).tolist()
+            ),
+            "serp_format":        serp_format,
+            "snippet_opportunity":snippet_opp,
+            "paa_to_add":         " | ".join(paa_needed[:5]),
+            "optimisation_actions": " → ".join(actions),
+            "effort":             "Low" if len(actions) <= 2 else "Medium",
+        })
+
+    if not fast_wins:
+        print("    → No fast-win clusters found")
+        return pd.DataFrame()
+
+    wins_df = (
+        pd.DataFrame(fast_wins)
+        .sort_values("win_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    wins_df.index += 1
+    wins_df.index.name = "priority"
+
+    path = os.path.join(output_dir, "page2_fast_wins.csv")
+    wins_df.to_csv(path)
+    print(f"    → {len(wins_df)} fast-win clusters → {path}")
+    print(f"    → Potential: {wins_df['keyword_count'].sum():,} keywords "
+          f"could move from page 2 → page 1")
+
+    return wins_df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 13. FRESHNESS PRIORITY SCORER
+# ═══════════════════════════════════════════════════════════════════════
+
+FRESHNESS_SIGNALS = [
+    r"\b(202[3-9]|20[3-9]\d)\b",                          # recent years
+    r"\b(new|latest|recent|update[d]?|current|emerging)\b",
+    r"\b(phase [23]|trial results|readout|approval|approved|fda|ema)\b",
+    r"\b(breakthrough|advance[d]?|novel|first.in.class|next.gen)\b",
+]
+
+def score_freshness_priority(df: pd.DataFrame, output_dir: str) -> pd.DataFrame:
+    """
+    Stage 13: Identify keyword clusters where SERP titles signal
+    recency demand — meaning stale content is actively losing ground.
+
+    Logic:
+    1. Detect recency signals in SERP titles (year mentions, "new", "latest",
+       clinical readout language, approval announcements)
+    2. Score each keyword by how strong those signals are
+    3. Combine with your position — if you rank 5-15 on a
+       freshness-sensitive topic, a content update is urgent
+    4. Output a prioritised refresh list by cluster
+
+    This is distinct from the gap analysis — these keywords already
+    have content, it's just ageing out of relevance.
+    """
+    print("\n[13] Scoring freshness priority...")
+
+    title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
+
+    def freshness_score(row) -> float:
+        """Count recency signals across SERP titles for this keyword."""
+        titles = " ".join(
+            str(row.get(c, "")) for c in title_cols[:10]
+            if pd.notna(row.get(c))
+        )
+        if "enriched_text" in row.index and "|" in str(row.get("enriched_text", "")):
+            titles = " ".join(str(row["enriched_text"]).split("|")[1:])
+        titles = titles.lower()
+        hits = sum(
+            len(re.findall(p, titles)) for p in FRESHNESS_SIGNALS
+        )
+        return min(1.0, hits / 5)   # normalise 0-1
+
+    df["freshness_signal"] = df.apply(freshness_score, axis=1)
+
+    # Freshness priority = high signal + you rank (content exists but may be stale)
+    # Only flag keywords where you're ranking — no point refreshing content
+    # you don't have
+    df["freshness_priority"] = (
+        df["freshness_signal"] >= 0.4
+    ) & (
+        df["position"] < 999
+    )
+
+    # Roll up to cluster level
+    fresh_clusters = []
+
+    for (area, cluster), group in df[df["freshness_priority"]].groupby(
+        ["research_area", "cluster_label"]
+    ):
+        avg_signal = group["freshness_signal"].mean()
+        avg_pos    = group["position"].replace(999, np.nan).mean()
+        total_imp  = group["impressions"].sum()
+        kw_count   = len(group)
+
+        # Sample the freshness signals detected
+        sample_titles = []
+        for col in title_cols[:3]:
+            vals = group[col].dropna().head(2).tolist()
+            sample_titles.extend([str(v) for v in vals if str(v).strip()])
+
+        refresh_urgency = (
+            "🔴 Urgent" if avg_signal >= 0.7 and (avg_pos or 999) < 15
+            else "🟡 Soon"   if avg_signal >= 0.5
+            else "🟢 Watch"
+        )
+
+        fresh_clusters.append({
+            "refresh_score":   round(avg_signal * 0.6 +
+                                     (1 - min(1, (avg_pos or 50) / 50)) * 0.4, 3),
+            "urgency":         refresh_urgency,
+            "research_area":   area,
+            "cluster":         cluster,
+            "keyword_count":   kw_count,
+            "avg_position":    round(avg_pos, 1) if avg_pos else "—",
+            "total_impressions": int(total_imp),
+            "freshness_signal":round(avg_signal, 2),
+            "top_keywords":    " | ".join(
+                group.sort_values("impressions", ascending=False)
+                ["keyword"].head(8).tolist()
+            ),
+            "recency_evidence":"; ".join(sample_titles[:3]),
+            "recommended_action": (
+                "Update with latest clinical data, trial results, or recent publications. "
+                "Add publication date and 'Last updated' tag. "
+                "Refresh statistics and cited studies."
+            ),
+        })
+
+    if not fresh_clusters:
+        print("    → No freshness-sensitive clusters detected")
+        return pd.DataFrame()
+
+    fresh_df = (
+        pd.DataFrame(fresh_clusters)
+        .sort_values("refresh_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    fresh_df.index += 1
+    fresh_df.index.name = "priority"
+
+    path = os.path.join(output_dir, "freshness_priority.csv")
+    fresh_df.to_csv(path)
+
+    urgent = (fresh_df["urgency"] == "🔴 Urgent").sum()
+    print(f"    → {len(fresh_df)} freshness-sensitive clusters | "
+          f"{urgent} urgent → {path}")
+
+    return fresh_df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 14. TOPIC CLUSTER MAPPER (HUB & SPOKE)
+# ═══════════════════════════════════════════════════════════════════════
+
+def map_topic_clusters(df: pd.DataFrame, kw_emb: np.ndarray,
+                        output_dir: str) -> pd.DataFrame:
+    """
+    Stage 14: Map keywords into hub-and-spoke topic structures
+    for internal linking strategy.
+
+    Why this matters for rankings:
+    Internal links signal to Google which pages are authoritative
+    on a topic. A hub page on "CAR-T cell therapy" that links to
+    spokes on "CAR-T manufacturing", "CAR-T toxicity management",
+    "CAR-T vs BiTE" etc. builds topical authority much faster
+    than isolated pages.
+
+    This stage identifies:
+      HUB candidates — broad keywords with high search volume / impression
+                        that could serve as pillar pages linking outward
+      SPOKE candidates — specific sub-topic keywords that should link
+                         back to the hub
+      ORPHANS — keywords that have no natural hub in your current
+                keyword set (content gaps for hub pages)
+
+    Output:
+      topic_clusters.csv — hub-spoke mapping for each research area
+                           ready to inform site architecture and
+                           internal linking decisions
+    """
+    print("\n[14] Mapping hub-and-spoke topic clusters...")
+
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    classified = df[
+        df["research_area"] != "Unclassified / General Methods"
+    ].copy()
+
+    topic_clusters = []
+
+    for area in classified["research_area"].unique():
+        area_df = classified[classified["research_area"] == area].copy()
+
+        if len(area_df) < 5:
+            continue
+
+        area_indices = area_df.index.tolist()
+        a_emb        = kw_emb[area_indices]
+
+        # ── Identify hub candidates
+        # Hubs are broad, high-volume keywords — they represent the pillar topic
+        # Proxy: shorter keyword (fewer words), higher impressions
+        area_df["word_count_kw"] = area_df["keyword"].str.split().str.len()
+
+        # Hub score: fewer words + more impressions = broader pillar candidate
+        max_imp = area_df["impressions"].max() or 1
+        area_df["hub_score"] = (
+            (1 / area_df["word_count_kw"].clip(1, 10)) * 0.5 +
+            (area_df["impressions"] / max_imp)           * 0.5
+        )
+
+        n_hubs = max(1, min(5, len(area_df) // 10))
+        hub_mask   = area_df.nlargest(n_hubs, "hub_score")
+        spoke_mask = area_df[~area_df.index.isin(hub_mask.index)]
+
+        hub_embs   = a_emb[[area_indices.index(i) for i in hub_mask.index]]
+
+        # For each hub, find its spokes (closest non-hub keywords)
+        for hub_idx, hub_row in hub_mask.iterrows():
+            hub_emb_vec = kw_emb[hub_idx].reshape(1, -1)
+
+            # Cosine sim from this hub to all spokes in area
+            spoke_indices = [area_indices.index(i)
+                             for i in spoke_mask.index if i in area_indices]
+            if not spoke_indices:
+                continue
+
+            spoke_embs = a_emb[spoke_indices]
+            sims       = cosine_similarity(hub_emb_vec, spoke_embs)[0]
+
+            spoke_df = spoke_mask.copy()
+            spoke_df["hub_similarity"] = sims
+
+            # Direct spokes: sim > 0.6 (clearly related)
+            direct_spokes = spoke_df[spoke_df["hub_similarity"] > 0.60]
+            # Weak spokes: 0.4-0.6 (loosely related)
+            weak_spokes   = spoke_df[
+                (spoke_df["hub_similarity"] >= 0.40) &
+                (spoke_df["hub_similarity"] <= 0.60)
+            ]
+
+            # Identify orphans: spokes with very low similarity to ANY hub
+            orphan_threshold = 0.35
+            orphan_mask = spoke_df["hub_similarity"] < orphan_threshold
+
+            topic_clusters.append({
+                "research_area":       area,
+                "hub_keyword":         hub_row["keyword"],
+                "hub_impressions":     int(hub_row["impressions"]),
+                "hub_position":        round(hub_row["position"], 1)
+                                       if hub_row["position"] < 999 else "Not ranking",
+                "hub_recommendation":  (
+                    "✓ Strengthen as pillar page — expand coverage and add internal links"
+                    if hub_row["position"] < 20 else
+                    "⚠ Hub not ranking — create or significantly expand this page first"
+                ),
+                "direct_spoke_count":  len(direct_spokes),
+                "direct_spokes":       " | ".join(
+                    direct_spokes.sort_values("impressions", ascending=False)
+                    ["keyword"].head(10).tolist()
+                ),
+                "weak_spoke_count":    len(weak_spokes),
+                "weak_spokes":         " | ".join(
+                    weak_spokes.sort_values("impressions", ascending=False)
+                    ["keyword"].head(5).tolist()
+                ),
+                "orphan_count":        int(orphan_mask.sum()),
+                "orphan_keywords":     " | ".join(
+                    spoke_df[orphan_mask]["keyword"].head(5).tolist()
+                ),
+                "internal_link_action": (
+                    f"Link {len(direct_spokes)} spoke pages back to this hub. "
+                    f"Ensure hub page explicitly covers: "
+                    f"{', '.join(direct_spokes['keyword'].head(3).tolist())}."
+                ) if len(direct_spokes) > 0 else
+                    "No close spokes found — this may be an isolated topic",
+            })
+
+    if not topic_clusters:
+        print("    → No topic cluster structure identified")
+        return pd.DataFrame()
+
+    tc_df = (
+        pd.DataFrame(topic_clusters)
+        .sort_values(["research_area", "hub_impressions"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    tc_df.index += 1
+    tc_df.index.name = "cluster_rank"
+
+    path = os.path.join(output_dir, "topic_clusters.csv")
+    tc_df.to_csv(path)
+
+    total_orphans = tc_df["orphan_count"].sum()
+    print(f"    → {len(tc_df)} hub-spoke clusters mapped | "
+          f"{total_orphans} orphaned keywords → {path}")
+
+    print("\n    Hub-spoke summary by research area:")
+    for area, grp in tc_df.groupby("research_area"):
+        hubs    = len(grp)
+        spokes  = grp["direct_spoke_count"].sum()
+        orphans = grp["orphan_count"].sum()
+        print(f"      {area:<35} {hubs} hubs · {spokes} spokes · {orphans} orphans")
+
+    return tc_df
+
+
+def generate_visibility_html(wins_df: pd.DataFrame, fresh_df: pd.DataFrame,
+                              tc_df: pd.DataFrame, intent_df: pd.DataFrame) -> str:
+    """Generate the HTML section for all visibility stages."""
+
+    sections = []
+
+    # ── Page 2 Fast Wins
+    if len(wins_df) > 0:
+        rows = ""
+        for rank, row in wins_df.head(15).iterrows():
+            snippet_badge = (
+                "<span style='background:#198754;color:white;border-radius:3px;"
+                "padding:1px 6px;font-size:0.75em;margin-left:4px'>⭐ Snippet</span>"
+                if row.get("snippet_opportunity") else ""
+            )
+            rows += f"""
+            <tr>
+              <td style='font-weight:700;text-align:center'>{rank}</td>
+              <td>{row['research_area']}</td>
+              <td><strong>{row['primary_keyword']}</strong>{snippet_badge}</td>
+              <td style='text-align:center'>{row['avg_position']}</td>
+              <td style='text-align:center'>{row['keyword_count']}</td>
+              <td style='text-align:center'>{row['total_impressions']:,}</td>
+              <td style='font-size:0.8em;color:#495057'>{row['optimisation_actions']}</td>
+              <td style='text-align:center'>{row['effort']}</td>
+            </tr>"""
+
+        sections.append(f"""
+  <h2>⚡ Page 2 Fast Wins ({len(wins_df)} clusters)</h2>
+  <p style='font-size:0.87em;color:#555;margin-bottom:16px'>
+    Keywords ranking 11–20 where targeted content edits could move to page 1.
+    Sorted by proximity to page 1 and impression volume.
+  </p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Area</th><th>Primary Keyword</th>
+      <th>Avg Pos</th><th>Keywords</th><th>Impressions</th>
+      <th>Optimisation Actions</th><th>Effort</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>""")
+
+    # ── Freshness Priority
+    if len(fresh_df) > 0:
+        rows = ""
+        for rank, row in fresh_df.head(15).iterrows():
+            urgency_colour = {
+                "🔴 Urgent": "#dc3545",
+                "🟡 Soon":   "#fd7e14",
+                "🟢 Watch":  "#198754",
+            }.get(row["urgency"], "#6c757d")
+            rows += f"""
+            <tr>
+              <td style='font-weight:700;text-align:center'>{rank}</td>
+              <td><span style='color:{urgency_colour}'>{row['urgency']}</span></td>
+              <td>{row['research_area']}</td>
+              <td><strong>{row['cluster']}</strong></td>
+              <td style='text-align:center'>{row['avg_position']}</td>
+              <td style='text-align:center'>{row['keyword_count']}</td>
+              <td style='font-size:0.78em;color:#555;font-style:italic'>
+                {str(row['recency_evidence'])[:80]}...</td>
+            </tr>"""
+
+        sections.append(f"""
+  <h2>🔄 Freshness Priority ({len(fresh_df)} clusters)</h2>
+  <p style='font-size:0.87em;color:#555;margin-bottom:16px'>
+    Topics where SERP titles show strong recency signals — existing content
+    may be losing ground to newer pages. Refresh these to defend rankings.
+  </p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Urgency</th><th>Area</th><th>Topic</th>
+      <th>Your Pos</th><th>Keywords</th><th>Recency Evidence</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>""")
+
+    # ── Intent Mismatches
+    if "intent_mismatch" in intent_df.columns:
+        mismatches = intent_df[intent_df["intent_mismatch"]].copy()
+        if len(mismatches) > 0:
+            intent_summary = mismatches.groupby(
+                ["keyword_intent", "serp_intent"]
+            ).size().reset_index(name="count").sort_values("count", ascending=False)
+
+            rows = ""
+            for _, row in intent_summary.head(10).iterrows():
+                rows += f"""
+                <tr>
+                  <td>{row['keyword_intent']}</td>
+                  <td>→</td>
+                  <td>{row['serp_intent']}</td>
+                  <td style='text-align:center'>{row['count']:,}</td>
+                  <td style='font-size:0.8em;color:#dc3545'>
+                    Content targeting this query type unlikely to rank
+                  </td>
+                </tr>"""
+
+            sections.append(f"""
+  <h2>🎯 Intent Mismatches ({len(mismatches):,} keywords)</h2>
+  <p style='font-size:0.87em;color:#555;margin-bottom:16px'>
+    Keywords where your likely content type doesn't match what Google
+    rewards. These are structural ranking barriers — content quality
+    alone cannot overcome intent mismatch.
+  </p>
+  <table>
+    <thead><tr>
+      <th>Your Content Intent</th><th></th><th>SERP Rewards</th>
+      <th>Keywords Affected</th><th>Implication</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>""")
+
+    # ── Topic Clusters
+    if len(tc_df) > 0:
+        rows = ""
+        for rank, row in tc_df.head(20).iterrows():
+            hub_colour = (
+                "#198754" if str(row["hub_position"]) != "Not ranking"
+                and float(str(row["hub_position"]).replace("Not ranking","999")) < 20
+                else "#dc3545"
+            )
+            rows += f"""
+            <tr>
+              <td style='text-align:center;font-weight:700'>{rank}</td>
+              <td>{row['research_area']}</td>
+              <td><strong style='color:{hub_colour}'>{row['hub_keyword']}</strong></td>
+              <td style='text-align:center'>{row['hub_position']}</td>
+              <td style='text-align:center'>{row['direct_spoke_count']}</td>
+              <td style='text-align:center;color:#dc3545'>{row['orphan_count']}</td>
+              <td style='font-size:0.79em;color:#495057'>
+                {row['internal_link_action']}</td>
+            </tr>"""
+
+        sections.append(f"""
+  <h2>🕸 Topic Cluster Map ({len(tc_df)} hubs)</h2>
+  <p style='font-size:0.87em;color:#555;margin-bottom:16px'>
+    Hub-and-spoke structure for internal linking strategy.
+    Green hubs are ranking and can be strengthened.
+    Red hubs need to be created or significantly expanded first.
+    Orphans are keywords with no natural hub — consider whether a pillar page is missing.
+  </p>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Area</th><th>Hub Keyword</th><th>Hub Position</th>
+      <th>Spokes</th><th>Orphans</th><th>Action</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>""")
+
+    return "\n".join(sections)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -2232,11 +3122,30 @@ def main():
     briefs_html = generate_briefs_html(briefs_df, args.output)
 
     # ── Stage 10: SERP title mining — content angle gaps
-    # Re-use the same sentence transformer model (already loaded in Stage 3)
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer("all-MiniLM-L6-v2")
     serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
         df, args.output, model, n_gaps=12
+    )
+
+    # ── Stage 11: Search intent classification
+    df = run_intent_classification(df)
+
+    # ── Stage 12: Page 2 fast wins
+    wins_df = find_page2_fast_wins(df, args.output)
+
+    # ── Stage 13: Freshness priority
+    fresh_df = score_freshness_priority(df, args.output)
+
+    # ── Stage 14: Topic cluster mapper
+    tc_df = map_topic_clusters(df, kw_emb, args.output)
+
+    # ── Visibility HTML (stages 11-14)
+    visibility_html = generate_visibility_html(
+        wins_df   if len(wins_df)  > 0 else pd.DataFrame(),
+        fresh_df  if len(fresh_df) > 0 else pd.DataFrame(),
+        tc_df     if len(tc_df)    > 0 else pd.DataFrame(),
+        df,
     )
 
     # ── Save outputs
@@ -2246,6 +3155,9 @@ def main():
     recs_path          = os.path.join(args.output, "recommendations.csv")
     briefs_path        = os.path.join(args.output, "content_briefs.csv")
     serp_gaps_path     = os.path.join(args.output, "serp_content_gaps.csv")
+    wins_path          = os.path.join(args.output, "page2_fast_wins.csv")
+    fresh_path         = os.path.join(args.output, "freshness_priority.csv")
+    tc_path            = os.path.join(args.output, "topic_clusters.csv")
 
     df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
 
@@ -2264,7 +3176,8 @@ def main():
     recs.to_csv(recs_path)
     generate_report(df, recs, args.output,
                     briefs_html=briefs_html,
-                    serp_gaps_html=serp_gaps_html)
+                    serp_gaps_html=serp_gaps_html,
+                    visibility_html=visibility_html)
 
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
@@ -2273,6 +3186,9 @@ def main():
     print(f"   recommendations.csv   → {recs_path}")
     print(f"   content_briefs.csv    → {briefs_path}")
     print(f"   serp_content_gaps.csv → {serp_gaps_path}")
+    print(f"   page2_fast_wins.csv   → {wins_path}")
+    print(f"   freshness_priority.csv→ {fresh_path}")
+    print(f"   topic_clusters.csv    → {tc_path}")
     print(f"   report.html           → {os.path.join(args.output, 'report.html')}")
     print("═" * 62)
 
