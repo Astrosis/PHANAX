@@ -1,0 +1,630 @@
+"""
+Life Science Keyword Clustering & Research Area Recommendation Pipeline
+=======================================================================
+Input:  A plain .txt or .csv file with one keyword per line (or a 'keyword' column)
+Output: 
+  - clusters.csv         — every keyword with its assigned cluster + MeSH mapping
+  - recommendations.csv  — ranked research areas with opportunity scores
+  - report.html          — visual summary you can open in a browser
+
+Dependencies (all free / open-source):
+    pip install sentence-transformers scikit-learn pandas numpy requests plotly
+
+    No hdbscan or umap-learn needed — clustering and reduction use scikit-learn only.
+
+Usage:
+    python lifesci_keyword_pipeline.py --input keywords.txt
+    python lifesci_keyword_pipeline.py --input keywords.csv --col keyword --output ./results
+"""
+
+import argparse
+import os
+import json
+import time
+import warnings
+import requests
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+# 0. CLI
+# ─────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Life Science Keyword Clustering Pipeline")
+    parser.add_argument("--input",  required=True, help="Path to keyword file (.txt or .csv)")
+    parser.add_argument("--col",    default="keyword", help="Column name if CSV (default: 'keyword')")
+    parser.add_argument("--output", default="./output", help="Output directory (default: ./output)")
+    parser.add_argument("--min-cluster-size", type=int, default=3,
+                        help="Min keywords per cluster for OPTICS (default: 3)")
+    parser.add_argument("--top-n", type=int, default=20,
+                        help="Top N research area recommendations to surface (default: 20)")
+    return parser.parse_args()
+
+
+# ─────────────────────────────────────────────
+# 1. LOAD KEYWORDS
+# ─────────────────────────────────────────────
+
+def load_keywords(path: str, col: str) -> pd.DataFrame:
+    """Load keywords from .txt (one per line) or .csv."""
+    print(f"\n[1/6] Loading keywords from: {path}")
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".txt":
+        with open(path, "r", encoding="utf-8") as f:
+            keywords = [line.strip() for line in f if line.strip()]
+        df = pd.DataFrame({"keyword": keywords})
+    elif ext == ".csv":
+        df = pd.read_csv(path)
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found. Available: {list(df.columns)}")
+        df = df.rename(columns={col: "keyword"})
+        df = df[df["keyword"].notna()].reset_index(drop=True)
+    else:
+        raise ValueError("Input must be .txt or .csv")
+
+    df["keyword"] = df["keyword"].str.strip().str.lower()
+    df = df.drop_duplicates(subset="keyword").reset_index(drop=True)
+    print(f"    → {len(df)} unique keywords loaded")
+    return df
+
+
+# ─────────────────────────────────────────────
+# 2. SEMANTIC EMBEDDINGS
+# ─────────────────────────────────────────────
+
+def embed_keywords(df: pd.DataFrame) -> np.ndarray:
+    """Generate sentence embeddings using a free local model."""
+    print("\n[2/6] Generating semantic embeddings (local model — no API key needed)...")
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError("Run: pip install sentence-transformers")
+
+    # all-MiniLM-L6-v2 is fast, free, and works well for short keyword phrases
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(
+        df["keyword"].tolist(),
+        show_progress_bar=True,
+        batch_size=64,
+        normalize_embeddings=True
+    )
+    print(f"    → Embeddings shape: {embeddings.shape}")
+    return embeddings
+
+
+# ─────────────────────────────────────────────
+# 3. DIMENSIONALITY REDUCTION + CLUSTERING
+# ─────────────────────────────────────────────
+
+def _estimate_k(n: int) -> int:
+    """Heuristic: ~1 cluster per 8 keywords, bounded between 5 and 80."""
+    return max(5, min(80, n // 8))
+
+
+def cluster_keywords(df: pd.DataFrame, embeddings: np.ndarray, min_cluster_size: int) -> pd.DataFrame:
+    """
+    Dimensionality reduction + clustering using scikit-learn only.
+
+    Pipeline:
+      1. TruncatedSVD  → reduce to 50D  (fast, stable)
+      2. Agglomerative → hierarchical clustering (no k needed upfront; auto-estimated)
+         Falls back to KMeans if dataset is very large (>5000 keywords)
+      3. Post-filter    → tiny clusters below min_cluster_size are reassigned to
+                          their nearest valid cluster (no noise / empty output)
+      4. t-SNE          → 2D projection for visualization only
+
+    Why Agglomerative over OPTICS:
+      OPTICS frequently marks 80-100% of points as noise on normalized embedding
+      spaces because the density threshold is too strict. Agglomerative clustering
+      always assigns every keyword to a cluster, giving you clean output every time.
+    """
+    print("\n[3/6] Reducing dimensions and clustering (scikit-learn)...")
+
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import AgglomerativeClustering, KMeans
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import normalize
+    from sklearn.metrics import pairwise_distances_argmin_min
+
+    n = len(df)
+
+    # ── Step 1: TruncatedSVD to 50D
+    n_components = min(50, embeddings.shape[1] - 1, n - 1)
+    svd          = TruncatedSVD(n_components=n_components, random_state=42)
+    reduced      = svd.fit_transform(embeddings)
+    reduced      = normalize(reduced)
+
+    # ── Step 2: Cluster — Agglomerative for ≤5000 keywords, KMeans above that
+    k = _estimate_k(n)
+    print(f"    → Estimated k={k} clusters for {n} keywords")
+
+    if n <= 5000:
+        print("    → Using Agglomerative clustering...")
+        clusterer = AgglomerativeClustering(
+            n_clusters=k,
+            metric="cosine",
+            linkage="average"
+        )
+        labels = clusterer.fit_predict(reduced)
+    else:
+        print("    → Dataset >5000 keywords, using KMeans...")
+        clusterer = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels    = clusterer.fit_predict(reduced)
+
+    # ── Step 3: Merge tiny clusters into nearest valid cluster
+    #    (avoids empty recommendation output)
+    counts      = pd.Series(labels).value_counts()
+    small_ids   = counts[counts < min_cluster_size].index.tolist()
+    if small_ids:
+        valid_mask  = ~np.isin(labels, small_ids)
+        valid_embs  = reduced[valid_mask]
+        valid_labs  = labels[valid_mask]
+        small_mask  = np.isin(labels, small_ids)
+        if small_mask.sum() > 0 and valid_mask.sum() > 0:
+            nearest, _  = pairwise_distances_argmin_min(
+                reduced[small_mask], valid_embs, metric="cosine"
+            )
+            labels      = labels.copy()
+            labels[small_mask] = valid_labs[nearest]
+        merged = len(small_ids)
+        print(f"    → Merged {merged} undersized cluster(s) into nearest neighbours")
+
+    n_clusters = len(set(labels))
+    print(f"    → {n_clusters} clusters produced, 0 noise points")
+
+    # ── Step 4: t-SNE 2D for visualization
+    print("    → Running t-SNE for visualization (may take ~30s on large datasets)...")
+    perplexity  = min(30, max(5, n // 10))
+    tsne        = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        learning_rate="auto",
+        init="pca",
+        random_state=42
+    )
+    reduced_2d  = tsne.fit_transform(reduced)
+
+    df["cluster_id"] = labels
+    df["umap_x"]     = reduced_2d[:, 0]
+    df["umap_y"]     = reduced_2d[:, 1]
+    return df
+
+
+# ─────────────────────────────────────────────
+# 4. AUTO-LABEL CLUSTERS
+# ─────────────────────────────────────────────
+
+def label_clusters(df: pd.DataFrame, embeddings: np.ndarray) -> pd.DataFrame:
+    """
+    For each cluster, find the keyword closest to the cluster centroid.
+    That keyword becomes the cluster's representative label.
+    Also build a comma-separated list of top keywords per cluster.
+    """
+    print("\n[4/6] Auto-labeling clusters...")
+
+    labels_map   = {}
+    top_kws_map  = {}
+    size_map     = {}
+
+    for cid in sorted(df["cluster_id"].unique()):
+        if cid == -1:
+            labels_map[cid]  = "Unclustered / Noise"
+            top_kws_map[cid] = ""
+            size_map[cid]    = int((df["cluster_id"] == -1).sum())
+            continue
+
+        mask        = df["cluster_id"] == cid
+        cluster_kws = df.loc[mask, "keyword"].tolist()
+        cluster_emb = embeddings[mask.values]
+
+        # Centroid = mean of embeddings in cluster
+        centroid    = cluster_emb.mean(axis=0)
+        # Closest keyword to centroid
+        sims        = cluster_emb @ centroid
+        best_idx    = sims.argmax()
+        label       = cluster_kws[best_idx]
+
+        labels_map[cid]  = label
+        top_kws_map[cid] = ", ".join(cluster_kws[:10])
+        size_map[cid]    = len(cluster_kws)
+
+    df["cluster_label"]    = df["cluster_id"].map(labels_map)
+    df["cluster_top_kws"]  = df["cluster_id"].map(top_kws_map)
+    df["cluster_size"]     = df["cluster_id"].map(size_map)
+    return df
+
+
+# ─────────────────────────────────────────────
+# 5. MeSH MAPPING via NCBI E-utilities (FREE)
+# ─────────────────────────────────────────────
+
+MESH_CACHE = {}
+
+def query_mesh(term: str) -> dict:
+    """
+    Query NCBI MeSH via the free E-utilities API.
+    Returns the best matching MeSH descriptor and its tree numbers (hierarchy path).
+    Rate limited to ~3 req/sec to stay within NCBI's free tier.
+    """
+    if term in MESH_CACHE:
+        return MESH_CACHE[term]
+
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    result = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
+
+    try:
+        # Step 1: Search for matching MeSH UIDs
+        search_url = (
+            f"{base}esearch.fcgi?db=mesh&term={requests.utils.quote(term)}"
+            f"&retmax=1&retmode=json"
+        )
+        r = requests.get(search_url, timeout=10)
+        data = r.json()
+        ids = data.get("esearchresult", {}).get("idlist", [])
+
+        if not ids:
+            MESH_CACHE[term] = result
+            return result
+
+        # Step 2: Fetch descriptor details
+        fetch_url = (
+            f"{base}esummary.fcgi?db=mesh&id={ids[0]}&retmode=json"
+        )
+        r2 = requests.get(fetch_url, timeout=10)
+        summary = r2.json().get("result", {}).get(ids[0], {})
+
+        ds_meshterms = summary.get("ds_meshterms", [])
+        ds_idxlinks  = summary.get("ds_idxlinks", "")
+
+        if ds_meshterms:
+            result["mesh_term"] = ds_meshterms[0] if ds_meshterms else None
+
+        # Tree numbers encode the MeSH hierarchy (e.g., C04 = Neoplasms)
+        tree_nums = summary.get("ds_treenums", [])
+        if tree_nums:
+            result["mesh_tree"] = tree_nums[0]
+            result["mesh_category"] = _tree_to_category(tree_nums[0])
+
+    except Exception:
+        pass  # Silently skip on network errors; MeSH enrichment is optional
+
+    MESH_CACHE[term] = result
+    time.sleep(0.34)  # ~3 req/sec limit
+    return result
+
+
+# Top-level MeSH tree categories relevant to life sciences
+MESH_TREE_MAP = {
+    "A": "Anatomy",
+    "B": "Organisms",
+    "C": "Diseases",
+    "D": "Chemicals & Drugs",
+    "E": "Analytical / Diagnostic Techniques",
+    "F": "Psychiatry & Psychology",
+    "G": "Biological Sciences",
+    "H": "Physical Sciences",
+    "I": "Social Sciences",
+    "J": "Technology / Industry / Agriculture",
+    "K": "Humanities",
+    "L": "Information Science",
+    "M": "Named Groups",
+    "N": "Health Care",
+    "V": "Publication Characteristics",
+    "Z": "Geographic Locations",
+}
+
+DISEASE_SUBTREES = {
+    "C04": "Neoplasms / Cancer",
+    "C10": "Nervous System Diseases",
+    "C14": "Cardiovascular Diseases",
+    "C18": "Metabolic Diseases",
+    "C20": "Immune System Diseases",
+    "C23": "Pathological Conditions",
+    "C13": "Female Urogenital Diseases",
+    "C12": "Male Urogenital Diseases",
+    "C08": "Respiratory Diseases",
+    "C06": "Digestive System Diseases",
+    "C05": "Musculoskeletal Diseases",
+    "C15": "Hemic / Lymphatic Diseases",
+    "C16": "Congenital / Hereditary Diseases",
+    "C17": "Skin Diseases",
+}
+
+def _tree_to_category(tree: str) -> str:
+    prefix3 = tree[:3]
+    prefix1 = tree[:1]
+    return DISEASE_SUBTREES.get(prefix3,
+           MESH_TREE_MAP.get(prefix1, "Other Life Science"))
+
+
+def map_clusters_to_mesh(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each cluster, query MeSH using the cluster's representative label.
+    This maps semantic clusters onto the established medical taxonomy.
+    """
+    print("\n[5/6] Mapping clusters to MeSH taxonomy (NCBI free API)...")
+    print("      This may take a moment — rate limited to 3 req/sec per NCBI policy")
+
+    unique_labels = df["cluster_label"].dropna().unique()
+    mesh_results  = {}
+
+    for i, label in enumerate(unique_labels):
+        print(f"      [{i+1}/{len(unique_labels)}] Querying MeSH: '{label}'", end="\r")
+        mesh_results[label] = query_mesh(label)
+
+    print()
+
+    df["mesh_term"]     = df["cluster_label"].map(
+        lambda x: mesh_results.get(x, {}).get("mesh_term"))
+    df["mesh_tree"]     = df["cluster_label"].map(
+        lambda x: mesh_results.get(x, {}).get("mesh_tree"))
+    df["mesh_category"] = df["cluster_label"].map(
+        lambda x: mesh_results.get(x, {}).get("mesh_category"))
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# 6. SCORE & RECOMMEND RESEARCH AREAS
+# ─────────────────────────────────────────────
+
+def score_and_recommend(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """
+    Aggregate clusters into research area recommendations.
+
+    Scoring dimensions (all normalized 0–1):
+      - Volume Score : cluster size (keyword count) as proxy for demand breadth
+      - MeSH Score   : bonus if a confirmed MeSH mapping exists (validated topic)
+
+    If you later add GSC/SEMrush volume data, replace keyword_count with real search volume.
+    """
+    print("\n[6/6] Scoring clusters and generating recommendations...")
+
+    # Use all rows — Agglomerative never produces -1, but keep the filter
+    # as a safety net in case of future clusterer swaps
+    working = df[df["cluster_id"] != -1].copy()
+
+    if working.empty:
+        # Safety fallback: if somehow everything was marked noise, use all rows
+        print("    ⚠ All points were noise — using full dataset as fallback")
+        working = df.copy()
+
+    # One representative MeSH term per cluster (take first non-null)
+    mesh_lookup = (
+        working[working["mesh_term"].notna()]
+        .groupby("cluster_id")[["mesh_term", "mesh_category"]]
+        .first()
+        .reset_index()
+    )
+
+    cluster_df = (
+        working
+        .groupby(["cluster_id", "cluster_label"])
+        .agg(
+            keyword_count   = ("keyword", "count"),
+            sample_keywords = ("keyword", lambda x: " | ".join(list(x)[:8]))
+        )
+        .reset_index()
+        .merge(mesh_lookup, on="cluster_id", how="left")
+    )
+
+    # Normalize keyword count (volume proxy) 0–1
+    max_count = cluster_df["keyword_count"].max()
+    cluster_df["volume_score"] = cluster_df["keyword_count"] / max_count
+
+    # MeSH validation bonus: +0.3 if a MeSH term was found
+    cluster_df["mesh_score"] = cluster_df["mesh_term"].notna().astype(float) * 0.3
+
+    # Composite opportunity score
+    cluster_df["opportunity_score"] = (
+        cluster_df["volume_score"] * 0.6 +
+        cluster_df["mesh_score"]   * 0.4
+    ).round(3)
+
+    # Priority tier
+    def tier(score):
+        if score >= 0.6:  return "🔴 High Priority"
+        if score >= 0.35: return "🟡 Medium Priority"
+        return              "🟢 Explore / Monitor"
+
+    cluster_df["priority"] = cluster_df["opportunity_score"].apply(tier)
+
+    # Sort and take top N
+    recs = cluster_df.sort_values("opportunity_score", ascending=False).head(top_n)
+    recs = recs.reset_index(drop=True)
+    recs.index += 1  # 1-based rank
+    recs.index.name = "rank"
+
+    print(f"    → Top {top_n} research area recommendations generated")
+    return cluster_df, recs
+
+
+# ─────────────────────────────────────────────
+# 7. HTML REPORT
+# ─────────────────────────────────────────────
+
+def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
+    """Generate a standalone HTML report with an interactive UMAP scatter plot."""
+    print("\n    → Generating HTML report...")
+
+    try:
+        import plotly.express as px
+        import plotly.io as pio
+
+        plot_df = df[df["cluster_id"] != -1].copy() if (df["cluster_id"] == -1).any() else df.copy()
+        plot_df["label_display"] = plot_df["cluster_label"].str.title()
+
+        fig = px.scatter(
+            plot_df,
+            x="umap_x", y="umap_y",
+            color="cluster_label",
+            hover_data=["keyword", "mesh_term", "mesh_category"],
+            title="Keyword Cluster Map — Life Science Research Areas",
+            labels={"umap_x": "t-SNE 1", "umap_y": "t-SNE 2"},
+            height=700,
+            template="plotly_white"
+        )
+        fig.update_traces(marker=dict(size=6, opacity=0.75))
+        fig.update_layout(legend_title_text="Cluster", showlegend=True)
+
+        scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
+    except ImportError:
+        scatter_html = "<p><em>Install plotly for interactive visualization: pip install plotly</em></p>"
+
+    # Build recommendations table HTML
+    rec_rows = ""
+    for rank, row in recs.iterrows():
+        rec_rows += f"""
+        <tr>
+          <td style='text-align:center'><strong>{rank}</strong></td>
+          <td><strong>{str(row['cluster_label']).title()}</strong></td>
+          <td>{row.get('mesh_term') or '—'}</td>
+          <td>{row.get('mesh_category') or '—'}</td>
+          <td style='text-align:center'>{row['keyword_count']}</td>
+          <td style='text-align:center'>{row['opportunity_score']:.3f}</td>
+          <td>{row['priority']}</td>
+          <td style='font-size:0.85em;color:#555'>{row['sample_keywords']}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Life Science Keyword Cluster Report</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            margin: 0; padding: 20px 40px; background: #f8f9fa; color: #212529; }}
+    h1   {{ color: #1a1a2e; border-bottom: 3px solid #4361ee; padding-bottom: 10px; }}
+    h2   {{ color: #4361ee; margin-top: 40px; }}
+    .stats {{ display: flex; gap: 20px; flex-wrap: wrap; margin: 20px 0; }}
+    .stat-card {{ background: white; border-radius: 10px; padding: 16px 24px;
+                  box-shadow: 0 2px 8px rgba(0,0,0,.08); min-width: 140px; }}
+    .stat-card .num  {{ font-size: 2em; font-weight: 700; color: #4361ee; }}
+    .stat-card .lbl  {{ font-size: 0.85em; color: #6c757d; margin-top: 4px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white;
+             border-radius: 10px; overflow: hidden;
+             box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
+    th    {{ background: #4361ee; color: white; padding: 12px 10px;
+             text-align: left; font-size: 0.88em; }}
+    td    {{ padding: 10px; border-bottom: 1px solid #e9ecef; font-size: 0.9em; }}
+    tr:hover td {{ background: #f0f4ff; }}
+    .plot-wrap {{ background: white; border-radius: 10px; padding: 20px;
+                  box-shadow: 0 2px 8px rgba(0,0,0,.08); margin: 20px 0; }}
+    .note {{ background: #fff3cd; border-left: 4px solid #ffc107;
+             padding: 12px 16px; border-radius: 4px; margin: 20px 0;
+             font-size: 0.9em; }}
+  </style>
+</head>
+<body>
+  <h1>🔬 Life Science Keyword Cluster Report</h1>
+
+  <div class="stats">
+    <div class="stat-card"><div class="num">{len(df)}</div><div class="lbl">Total Keywords</div></div>
+    <div class="stat-card"><div class="num">{df['cluster_id'].nunique()}</div><div class="lbl">Clusters Found</div></div>
+    <div class="stat-card"><div class="num">{int((df['cluster_id']==-1).sum())}</div><div class="lbl">Noise / Unclustered</div></div>
+    <div class="stat-card"><div class="num">{int(df['mesh_term'].notna().sum())}</div><div class="lbl">MeSH Mapped</div></div>
+  </div>
+
+  <div class="note">
+    <strong>Scoring note:</strong> Opportunity Score is currently based on cluster size (keyword breadth) + MeSH validation.
+    To upgrade scoring, merge in real search volume from GSC/SEMrush before running the pipeline — the scorer will automatically use it.
+  </div>
+
+  <h2>📊 Interactive Cluster Map</h2>
+  <div class="plot-wrap">{scatter_html}</div>
+
+  <h2>🎯 Top Research Area Recommendations</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Research Area</th><th>MeSH Term</th><th>MeSH Category</th>
+        <th>Keyword Count</th><th>Opp. Score</th><th>Priority</th><th>Sample Keywords</th>
+      </tr>
+    </thead>
+    <tbody>{rec_rows}</tbody>
+  </table>
+
+  <p style="margin-top:40px;color:#aaa;font-size:0.8em">
+    Generated by lifesci_keyword_pipeline.py — 
+    Embeddings: all-MiniLM-L6-v2 | Reduction: TruncatedSVD + t-SNE | Clustering: OPTICS | Taxonomy: NCBI MeSH
+  </p>
+</body>
+</html>"""
+
+    path = os.path.join(output_dir, "report.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"    → Report saved: {path}")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
+
+    # ── 1. Load
+    df = load_keywords(args.input, args.col)
+
+    # ── 2. Embed
+    embeddings = embed_keywords(df)
+
+    # ── 3. Cluster
+    df = cluster_keywords(df, embeddings, args.min_cluster_size)
+
+    # ── 4. Label
+    df = label_clusters(df, embeddings)
+
+    # ── 5. MeSH map
+    df = map_clusters_to_mesh(df)
+
+    # ── 6. Score
+    cluster_df, recs = score_and_recommend(df, args.top_n)
+
+    # ── 7. Save outputs
+    clusters_path = os.path.join(args.output, "clusters.csv")
+    recs_path     = os.path.join(args.output, "recommendations.csv")
+
+    df.drop(columns=["umap_x", "umap_y"], errors="ignore").to_csv(clusters_path, index=False)
+    recs.to_csv(recs_path)
+    generate_report(df, recs, args.output)
+
+    print("\n" + "═"*60)
+    print("✅  Pipeline complete!")
+    print(f"   clusters.csv        → {clusters_path}")
+    print(f"   recommendations.csv → {recs_path}")
+    print(f"   report.html         → {os.path.join(args.output, 'report.html')}")
+    print("═"*60)
+
+    print("\n📋  Top 10 Research Area Recommendations:")
+    print(recs[["cluster_label","mesh_category","keyword_count",
+                "opportunity_score","priority"]].head(10).to_string())
+
+
+# ─────────────────────────────────────────────
+# OPTIONAL: Add search volume from GSC / SEMrush
+# ─────────────────────────────────────────────
+# If you have a CSV with columns [keyword, volume], call this BEFORE score_and_recommend():
+#
+#   volume_df = pd.read_csv("volumes.csv")   # columns: keyword, volume
+#   df = df.merge(volume_df, on="keyword", how="left")
+#   df["volume"] = df["volume"].fillna(0)
+#
+# Then in score_and_recommend(), replace:
+#   cluster_df["volume_score"] = cluster_df["keyword_count"] / max_count
+# with:
+#   cluster_df["total_volume"] = df.groupby("cluster_id")["volume"].sum().values
+#   cluster_df["volume_score"] = cluster_df["total_volume"] / cluster_df["total_volume"].max()
+#
+# This makes the opportunity score reflect real search demand. ─────────────────────────────────────────────
+
+
+if __name__ == "__main__":
+    main()
