@@ -2,15 +2,22 @@
 Life Science Keyword Clustering & Research Area Recommendation Pipeline
 =======================================================================
 Input:  A plain .txt or .csv file with one keyword per line (or a 'keyword' column)
-Output: 
-  - clusters.csv         — every keyword with its assigned cluster + MeSH mapping
+Output:
+  - clusters.csv         — every keyword with its research area + sub-topic cluster
   - recommendations.csv  — ranked research areas with opportunity scores
-  - report.html          — visual summary you can open in a browser
+  - report.html          — visual summary with interactive scatter plot
+
+How it works:
+  1. Embed all keywords semantically (free local model, no API key)
+  2. Map EVERY keyword to a predefined life science research area taxonomy
+     using cosine similarity — output is always "Cancer", "Neurology" etc.
+  3. Cluster into sub-topics within those areas (surfaces themes like
+     "HER2 breast cancer" or "KRAS lung cancer" within Oncology)
+  4. Score and rank research areas by keyword coverage + similarity strength
+  5. MeSH is NOT used as the source of area names (that was the bug)
 
 Dependencies (all free / open-source):
-    pip install sentence-transformers scikit-learn pandas numpy requests plotly
-
-    No hdbscan or umap-learn needed — clustering and reduction use scikit-learn only.
+    pip install sentence-transformers scikit-learn pandas numpy plotly
 
 Usage:
     python lifesci_keyword_pipeline.py --input keywords.txt
@@ -19,40 +26,248 @@ Usage:
 
 import argparse
 import os
-import json
-import time
 import warnings
-import requests
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════
+# RESEARCH AREA TAXONOMY
+# Each area has a rich description used for semantic matching.
+# To add a new area, just append a dict to this list.
+# ═══════════════════════════════════════════════════════════════════════
+
+RESEARCH_AREAS = [
+    {
+        "name": "Oncology / Cancer",
+        "description": (
+            "cancer tumor oncology malignancy carcinoma lymphoma leukemia melanoma "
+            "sarcoma metastasis chemotherapy immunotherapy targeted therapy "
+            "CAR-T cell therapy checkpoint inhibitor tumor microenvironment "
+            "solid tumor hematologic malignancy breast cancer lung cancer "
+            "colorectal cancer prostate cancer ovarian cancer pancreatic cancer "
+            "glioblastoma biomarker tumor suppressor oncogene KRAS EGFR HER2 PD-1 PD-L1"
+        ),
+    },
+    {
+        "name": "Neurology / Neuroscience",
+        "description": (
+            "neurology neuroscience brain neuron synapse neurodegeneration "
+            "Alzheimer Parkinson multiple sclerosis ALS epilepsy stroke "
+            "dementia cognitive decline neuropathy blood brain barrier "
+            "glia astrocyte microglia neuroinflammation CNS psychiatric "
+            "depression anxiety schizophrenia ADHD autism brain tumor spinal cord"
+        ),
+    },
+    {
+        "name": "Cardiovascular Disease",
+        "description": (
+            "cardiovascular heart cardiac coronary artery disease myocardial infarction "
+            "heart failure atrial fibrillation hypertension atherosclerosis "
+            "stroke vascular endothelium lipid cholesterol thrombosis "
+            "anticoagulant platelet troponin BNP cardiomyopathy arrhythmia "
+            "valve aorta peripheral arterial PCSK9 statin"
+        ),
+    },
+    {
+        "name": "Immunology / Inflammation",
+        "description": (
+            "immunology immune system inflammation autoimmune allergy "
+            "cytokine T cell B cell antibody innate adaptive immunity "
+            "rheumatoid arthritis lupus inflammatory bowel disease Crohn "
+            "complement macrophage neutrophil interleukin TNF interferon "
+            "mast cell dendritic cell regulatory T cell Treg immunosuppression "
+            "vaccine adjuvant antigen MHC HLA toll-like receptor"
+        ),
+    },
+    {
+        "name": "Infectious Disease / Microbiology",
+        "description": (
+            "infectious disease infection bacteria virus pathogen antimicrobial "
+            "antibiotic resistance HIV AIDS influenza SARS-CoV-2 COVID-19 "
+            "tuberculosis malaria fungal parasitic sepsis bacteremia "
+            "microbiome gut flora pathogenesis virulence host defense "
+            "vaccine antiviral antifungal epidemiology outbreak zoonotic RSV"
+        ),
+    },
+    {
+        "name": "Genomics / Genetics",
+        "description": (
+            "genomics genetics gene mutation variant sequencing DNA RNA "
+            "CRISPR gene editing genome-wide association GWAS exome "
+            "next-generation sequencing NGS single nucleotide polymorphism SNP "
+            "epigenetics methylation chromatin histone gene expression "
+            "transcriptomics RNA-seq mRNA non-coding RNA microRNA lncRNA "
+            "copy number variant chromosomal rearrangement hereditary inheritance"
+        ),
+    },
+    {
+        "name": "Cell Biology / Molecular Biology",
+        "description": (
+            "cell biology molecular biology cell signaling pathway "
+            "apoptosis autophagy cell cycle proliferation differentiation "
+            "stem cell organoid protein complex enzyme kinase phosphorylation "
+            "receptor ligand transcription factor Western blot immunoprecipitation "
+            "flow cytometry microscopy CRISPR knockout knockdown overexpression "
+            "plasmid transfection cell line culture co-immunoprecipitation"
+        ),
+    },
+    {
+        "name": "Metabolic Disease / Endocrinology",
+        "description": (
+            "metabolic disease diabetes obesity insulin resistance type 2 diabetes "
+            "type 1 diabetes glucose lipid metabolism fatty liver NASH NAFLD "
+            "thyroid adrenal pituitary hormone endocrine metabolic syndrome "
+            "dyslipidemia hyperglycemia glycemic control bariatric surgery "
+            "GLP-1 SGLT2 metformin adipose tissue adipokine leptin ghrelin"
+        ),
+    },
+    {
+        "name": "Respiratory / Pulmonary Disease",
+        "description": (
+            "respiratory pulmonary lung COPD asthma cystic fibrosis "
+            "interstitial lung disease pulmonary fibrosis pneumonia "
+            "ARDS ventilation bronchitis emphysema sleep apnea "
+            "inhaler bronchodilator corticosteroid airway inflammation "
+            "surfactant alveolar oxygen saturation spirometry FEV1"
+        ),
+    },
+    {
+        "name": "Rare Disease / Orphan Disease",
+        "description": (
+            "rare disease orphan disease genetic disorder enzyme deficiency "
+            "lysosomal storage disease muscular dystrophy Duchenne Becker "
+            "Huntington disease hemophilia sickle cell phenylketonuria PKU "
+            "Fabry Gaucher Pompe Wilson disease gene therapy enzyme replacement "
+            "newborn screening ultra-rare pediatric unmet medical need"
+        ),
+    },
+    {
+        "name": "Drug Discovery / Pharmacology",
+        "description": (
+            "drug discovery pharmacology small molecule compound library "
+            "high throughput screening HTS lead optimization ADMET "
+            "pharmacokinetics pharmacodynamics IC50 EC50 binding affinity "
+            "target engagement selectivity medicinal chemistry structure activity "
+            "clinical trial phase I II III FDA approval IND NDA drug candidate "
+            "in vitro in vivo preclinical toxicology"
+        ),
+    },
+    {
+        "name": "Biologics / Antibody Therapeutics",
+        "description": (
+            "biologics antibody monoclonal antibody bispecific antibody "
+            "ADC antibody drug conjugate biosimilar protein therapeutic "
+            "Fc region glycosylation CHO cell expression system "
+            "bioreactor upstream downstream purification formulation "
+            "immunogenicity subcutaneous intravenous half-life Fc fusion "
+            "nanobody VHH single domain antibody"
+        ),
+    },
+    {
+        "name": "Diagnostics / Biomarkers",
+        "description": (
+            "diagnostic biomarker assay test ELISA immunoassay PCR qPCR "
+            "liquid biopsy circulating tumor DNA ctDNA cfDNA proteomics "
+            "mass spectrometry metabolomics point of care lateral flow "
+            "sensitivity specificity ROC AUC clinical validation "
+            "companion diagnostic IVD laboratory test biopsy pathology"
+        ),
+    },
+    {
+        "name": "Dermatology / Skin Disease",
+        "description": (
+            "dermatology skin psoriasis eczema atopic dermatitis acne "
+            "melanoma basal cell carcinoma squamous cell carcinoma "
+            "wound healing scar fibrosis collagen elastin keratinocyte "
+            "transdermal topical retinoid biologic alopecia vitiligo rosacea"
+        ),
+    },
+    {
+        "name": "Gastroenterology / Hepatology",
+        "description": (
+            "gastroenterology hepatology liver gut intestine colon "
+            "inflammatory bowel disease IBD Crohn colitis celiac "
+            "hepatitis cirrhosis non-alcoholic fatty liver NASH fibrosis "
+            "microbiome gastrointestinal motility pancreas bile acid "
+            "endoscopy colonoscopy H pylori GI bleeding portal hypertension"
+        ),
+    },
+    {
+        "name": "Musculoskeletal / Bone Disease",
+        "description": (
+            "musculoskeletal bone joint muscle osteoporosis osteoarthritis "
+            "rheumatoid arthritis fracture cartilage tendon ligament "
+            "spine intervertebral disc osteoblast osteoclast bone density "
+            "DEXA scan bisphosphonate RANKL denosumab physical therapy"
+        ),
+    },
+    {
+        "name": "Ophthalmology / Eye Disease",
+        "description": (
+            "ophthalmology eye retina macular degeneration AMD glaucoma "
+            "diabetic retinopathy cataract cornea intraocular pressure "
+            "anti-VEGF intravitreal injection vitreous photoreceptor "
+            "optic nerve visual acuity OCT fluorescein angiography"
+        ),
+    },
+    {
+        "name": "Hematology / Blood Disease",
+        "description": (
+            "hematology blood anemia sickle cell hemophilia thrombocytopenia "
+            "myeloma lymphoma leukemia bone marrow transplant stem cell "
+            "erythrocyte platelet coagulation von Willebrand factor "
+            "iron deficiency thalassemia myelodysplastic syndrome MDS CLL AML"
+        ),
+    },
+    {
+        "name": "Renal / Kidney Disease",
+        "description": (
+            "renal kidney nephrology chronic kidney disease CKD acute kidney "
+            "injury dialysis transplant glomerulonephritis proteinuria "
+            "creatinine GFR RAAS ACE inhibitor podocyte fibrosis "
+            "polycystic kidney disease PKD IgA nephropathy"
+        ),
+    },
+    {
+        "name": "Reproductive Medicine / Women's Health",
+        "description": (
+            "reproductive medicine fertility IVF endometriosis PCOS "
+            "menopause contraception pregnancy maternal fetal obstetrics "
+            "cervical cancer ovarian cancer uterus endometrium hormone "
+            "estrogen progesterone FSH LH prenatal preeclampsia"
+        ),
+    },
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 0. CLI
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Life Science Keyword Clustering Pipeline")
+    parser = argparse.ArgumentParser(description="Life Science Keyword → Research Area Pipeline")
     parser.add_argument("--input",  required=True, help="Path to keyword file (.txt or .csv)")
     parser.add_argument("--col",    default="keyword", help="Column name if CSV (default: 'keyword')")
     parser.add_argument("--output", default="./output", help="Output directory (default: ./output)")
     parser.add_argument("--min-cluster-size", type=int, default=3,
-                        help="Min keywords per cluster for OPTICS (default: 3)")
+                        help="Min keywords per sub-topic cluster (default: 3)")
     parser.add_argument("--top-n", type=int, default=20,
-                        help="Top N research area recommendations to surface (default: 20)")
+                        help="Top N research areas to surface (default: 20)")
+    parser.add_argument("--threshold", type=float, default=0.20,
+                        help="Min cosine similarity to classify a keyword (default: 0.20)")
     return parser.parse_args()
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 # 1. LOAD KEYWORDS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 
 def load_keywords(path: str, col: str) -> pd.DataFrame:
-    """Load keywords from .txt (one per line) or .csv."""
-    print(f"\n[1/6] Loading keywords from: {path}")
+    print(f"\n[1/5] Loading keywords from: {path}")
     ext = os.path.splitext(path)[1].lower()
-
     if ext == ".txt":
         with open(path, "r", encoding="utf-8") as f:
             keywords = [line.strip() for line in f if line.strip()]
@@ -72,57 +287,103 @@ def load_keywords(path: str, col: str) -> pd.DataFrame:
     return df
 
 
-# ─────────────────────────────────────────────
-# 2. SEMANTIC EMBEDDINGS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 2. EMBED KEYWORDS + TAXONOMY
+# ═══════════════════════════════════════════════════════════════════════
 
-def embed_keywords(df: pd.DataFrame) -> np.ndarray:
-    """Generate sentence embeddings using a free local model."""
-    print("\n[2/6] Generating semantic embeddings (local model — no API key needed)...")
+def embed_all(df: pd.DataFrame):
+    """
+    Embed keywords AND research area descriptions in the same vector space
+    so cosine similarity between them is meaningful.
+    """
+    print("\n[2/5] Generating embeddings...")
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
         raise ImportError("Run: pip install sentence-transformers")
 
-    # all-MiniLM-L6-v2 is fast, free, and works well for short keyword phrases
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = model.encode(
+
+    print("      Embedding keywords...")
+    kw_emb = model.encode(
         df["keyword"].tolist(),
         show_progress_bar=True,
         batch_size=64,
         normalize_embeddings=True
     )
-    print(f"    → Embeddings shape: {embeddings.shape}")
-    return embeddings
+
+    print("      Embedding research area taxonomy...")
+    area_emb = model.encode(
+        [a["description"] for a in RESEARCH_AREAS],
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+
+    print(f"    → Keywords: {kw_emb.shape} | Areas: {area_emb.shape}")
+    return kw_emb, area_emb
 
 
-# ─────────────────────────────────────────────
-# 3. DIMENSIONALITY REDUCTION + CLUSTERING
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 3. MAP KEYWORDS → RESEARCH AREAS
+# ═══════════════════════════════════════════════════════════════════════
+
+def map_to_research_areas(df: pd.DataFrame, kw_emb: np.ndarray,
+                           area_emb: np.ndarray, threshold: float) -> pd.DataFrame:
+    """
+    Compute cosine similarity between every keyword and every research area.
+    Assign each keyword to its best-matching area.
+    Keywords below threshold → "Unclassified / General Methods"
+    """
+    print(f"\n[3/5] Mapping keywords to research areas (threshold={threshold})...")
+
+    # (n_keywords, n_areas) — dot product of normalized vectors = cosine similarity
+    sim = kw_emb @ area_emb.T
+
+    best_idx    = sim.argmax(axis=1)
+    best_score  = sim.max(axis=1)
+
+    # Second best (useful for cross-cutting keywords)
+    sim2        = sim.copy()
+    sim2[np.arange(len(sim2)), best_idx] = -1
+    second_idx  = sim2.argmax(axis=1)
+
+    area_names = [a["name"] for a in RESEARCH_AREAS]
+
+    df["research_area"]       = [
+        area_names[i] if s >= threshold else "Unclassified / General Methods"
+        for i, s in zip(best_idx, best_score)
+    ]
+    df["research_area_score"] = best_score.round(4)
+    df["research_area_2"]     = [area_names[i] for i in second_idx]
+
+    classified = (df["research_area"] != "Unclassified / General Methods").sum()
+    print(f"    → {classified}/{len(df)} keywords classified into a research area")
+    print(f"    → {len(df)-classified} below threshold → 'Unclassified / General Methods'")
+    print()
+    print("    Research area keyword counts:")
+    for area, cnt in df["research_area"].value_counts().items():
+        bar = "█" * min(40, cnt // max(1, len(df) // 200))
+        print(f"      {cnt:>5}  {bar}  {area}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. SUB-TOPIC CLUSTERING
+# ═══════════════════════════════════════════════════════════════════════
 
 def _estimate_k(n: int) -> int:
-    """Heuristic: ~1 cluster per 8 keywords, bounded between 5 and 80."""
-    return max(5, min(80, n // 8))
+    return max(3, min(60, n // 8))
 
 
-def cluster_keywords(df: pd.DataFrame, embeddings: np.ndarray, min_cluster_size: int) -> pd.DataFrame:
+def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
+                     min_cluster_size: int) -> pd.DataFrame:
     """
-    Dimensionality reduction + clustering using scikit-learn only.
-
-    Pipeline:
-      1. TruncatedSVD  → reduce to 50D  (fast, stable)
-      2. Agglomerative → hierarchical clustering (no k needed upfront; auto-estimated)
-         Falls back to KMeans if dataset is very large (>5000 keywords)
-      3. Post-filter    → tiny clusters below min_cluster_size are reassigned to
-                          their nearest valid cluster (no noise / empty output)
-      4. t-SNE          → 2D projection for visualization only
-
-    Why Agglomerative over OPTICS:
-      OPTICS frequently marks 80-100% of points as noise on normalized embedding
-      spaces because the density threshold is too strict. Agglomerative clustering
-      always assigns every keyword to a cluster, giving you clean output every time.
+    Cluster keywords into fine-grained sub-topics.
+    This is secondary to research area mapping — it reveals themes WITHIN areas,
+    e.g. within Oncology: "HER2 breast cancer", "KRAS colorectal", "PD-L1 NSCLC".
     """
-    print("\n[3/6] Reducing dimensions and clustering (scikit-learn)...")
+    print("\n[4/5] Clustering into sub-topic groups...")
 
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import AgglomerativeClustering, KMeans
@@ -130,567 +391,241 @@ def cluster_keywords(df: pd.DataFrame, embeddings: np.ndarray, min_cluster_size:
     from sklearn.preprocessing import normalize
     from sklearn.metrics import pairwise_distances_argmin_min
 
-    n = len(df)
+    n      = len(df)
+    n_comp = min(50, kw_emb.shape[1] - 1, n - 1)
 
-    # ── Step 1: TruncatedSVD to 50D
-    n_components = min(50, embeddings.shape[1] - 1, n - 1)
-    svd          = TruncatedSVD(n_components=n_components, random_state=42)
-    reduced      = svd.fit_transform(embeddings)
-    reduced      = normalize(reduced)
+    svd     = TruncatedSVD(n_components=n_comp, random_state=42)
+    reduced = normalize(svd.fit_transform(kw_emb))
 
-    # ── Step 2: Cluster — Agglomerative for ≤5000 keywords, KMeans above that
     k = _estimate_k(n)
-    print(f"    → Estimated k={k} clusters for {n} keywords")
+    print(f"    → k={k} sub-topic clusters for {n} keywords")
 
     if n <= 5000:
-        print("    → Using Agglomerative clustering...")
-        clusterer = AgglomerativeClustering(
-            n_clusters=k,
-            metric="cosine",
-            linkage="average"
-        )
-        labels = clusterer.fit_predict(reduced)
+        labels = AgglomerativeClustering(
+            n_clusters=k, metric="cosine", linkage="average"
+        ).fit_predict(reduced)
     else:
-        print("    → Dataset >5000 keywords, using KMeans...")
-        clusterer = KMeans(n_clusters=k, random_state=42, n_init="auto")
-        labels    = clusterer.fit_predict(reduced)
+        labels = KMeans(
+            n_clusters=k, random_state=42, n_init="auto"
+        ).fit_predict(reduced)
 
-    # ── Step 3: Merge tiny clusters into nearest valid cluster
-    #    (avoids empty recommendation output)
-    counts      = pd.Series(labels).value_counts()
-    small_ids   = counts[counts < min_cluster_size].index.tolist()
+    # Merge tiny clusters
+    counts    = pd.Series(labels).value_counts()
+    small_ids = counts[counts < min_cluster_size].index.tolist()
     if small_ids:
-        valid_mask  = ~np.isin(labels, small_ids)
-        valid_embs  = reduced[valid_mask]
-        valid_labs  = labels[valid_mask]
-        small_mask  = np.isin(labels, small_ids)
-        if small_mask.sum() > 0 and valid_mask.sum() > 0:
-            nearest, _  = pairwise_distances_argmin_min(
-                reduced[small_mask], valid_embs, metric="cosine"
+        vm = ~np.isin(labels, small_ids)
+        sm = np.isin(labels, small_ids)
+        if vm.sum() > 0 and sm.sum() > 0:
+            nearest, _ = pairwise_distances_argmin_min(
+                reduced[sm], reduced[vm], metric="cosine"
             )
-            labels      = labels.copy()
-            labels[small_mask] = valid_labs[nearest]
-        merged = len(small_ids)
-        print(f"    → Merged {merged} undersized cluster(s) into nearest neighbours")
+            labels = labels.copy()
+            labels[sm] = labels[vm][nearest]
+        print(f"    → Merged {len(small_ids)} tiny cluster(s)")
 
-    n_clusters = len(set(labels))
-    print(f"    → {n_clusters} clusters produced, 0 noise points")
+    # Label each cluster by keyword closest to centroid
+    label_map = {}
+    for cid in np.unique(labels):
+        mask     = labels == cid
+        embs     = reduced[mask]
+        centroid = embs.mean(axis=0)
+        closest  = df.loc[mask, "keyword"].iloc[(embs @ centroid).argmax()]
+        label_map[cid] = closest
 
-    # ── Step 4: t-SNE 2D for visualization
-    print("    → Running t-SNE for visualization (may take ~30s on large datasets)...")
-    perplexity  = min(30, max(5, n // 10))
-    tsne        = TSNE(
-        n_components=2,
-        perplexity=perplexity,
-        learning_rate="auto",
-        init="pca",
-        random_state=42
-    )
-    reduced_2d  = tsne.fit_transform(reduced)
+    df["cluster_id"]    = labels
+    df["cluster_label"] = [label_map[c] for c in labels]
+    print(f"    → {len(label_map)} sub-topic clusters")
 
-    df["cluster_id"] = labels
-    df["umap_x"]     = reduced_2d[:, 0]
-    df["umap_y"]     = reduced_2d[:, 1]
-    return df
-
-
-# ─────────────────────────────────────────────
-# 4. AUTO-LABEL CLUSTERS
-# ─────────────────────────────────────────────
-
-def label_clusters(df: pd.DataFrame, embeddings: np.ndarray) -> pd.DataFrame:
-    """
-    For each cluster, find the keyword closest to the cluster centroid.
-    That keyword becomes the cluster's representative label.
-    Also build a comma-separated list of top keywords per cluster.
-    """
-    print("\n[4/6] Auto-labeling clusters...")
-
-    labels_map   = {}
-    top_kws_map  = {}
-    size_map     = {}
-
-    for cid in sorted(df["cluster_id"].unique()):
-        if cid == -1:
-            labels_map[cid]  = "Unclustered / Noise"
-            top_kws_map[cid] = ""
-            size_map[cid]    = int((df["cluster_id"] == -1).sum())
-            continue
-
-        mask        = df["cluster_id"] == cid
-        cluster_kws = df.loc[mask, "keyword"].tolist()
-        cluster_emb = embeddings[mask.values]
-
-        # Centroid = mean of embeddings in cluster
-        centroid    = cluster_emb.mean(axis=0)
-        # Closest keyword to centroid
-        sims        = cluster_emb @ centroid
-        best_idx    = sims.argmax()
-        label       = cluster_kws[best_idx]
-
-        labels_map[cid]  = label
-        top_kws_map[cid] = ", ".join(cluster_kws[:10])
-        size_map[cid]    = len(cluster_kws)
-
-    df["cluster_label"]    = df["cluster_id"].map(labels_map)
-    df["cluster_top_kws"]  = df["cluster_id"].map(top_kws_map)
-    df["cluster_size"]     = df["cluster_id"].map(size_map)
-    return df
-
-
-# ─────────────────────────────────────────────
-# 5. MeSH MAPPING via NCBI E-utilities (FREE)
-# ─────────────────────────────────────────────
-
-# Top-level MeSH tree categories relevant to life sciences
-MESH_TREE_MAP = {
-    "A": "Anatomy",
-    "B": "Organisms",
-    "C": "Diseases",
-    "D": "Chemicals & Drugs",
-    "E": "Analytical / Diagnostic Techniques",
-    "F": "Psychiatry & Psychology",
-    "G": "Biological Sciences",
-    "H": "Physical Sciences",
-    "I": "Social Sciences",
-    "J": "Technology / Industry / Agriculture",
-    "K": "Humanities",
-    "L": "Information Science",
-    "M": "Named Groups",
-    "N": "Health Care",
-    "V": "Publication Characteristics",
-    "Z": "Geographic Locations",
-}
-
-DISEASE_SUBTREES = {
-    "C04": "Neoplasms / Cancer",
-    "C10": "Nervous System Diseases",
-    "C14": "Cardiovascular Diseases",
-    "C18": "Metabolic Diseases",
-    "C20": "Immune System Diseases",
-    "C23": "Pathological Conditions",
-    "C13": "Female Urogenital Diseases",
-    "C12": "Male Urogenital Diseases",
-    "C08": "Respiratory Diseases",
-    "C06": "Digestive System Diseases",
-    "C05": "Musculoskeletal Diseases",
-    "C15": "Hemic / Lymphatic Diseases",
-    "C16": "Congenital / Hereditary Diseases",
-    "C17": "Skin Diseases",
-    "C07": "Stomatognathic Diseases",
-    "C09": "Otorhinolaryngologic Diseases",
-    "C11": "Eye Diseases",
-    "C19": "Endocrine System Diseases",
-    "C21": "Disorders of Environmental Origin",
-    "C22": "Animal Diseases",
-    "C26": "Wounds and Injuries",
-    "G01": "Biological Sciences (General)",
-    "G02": "Chemical Phenomena",
-    "G03": "Metabolism",
-    "G04": "Cell Physiological Phenomena",
-    "G05": "Genetic Phenomena",
-    "G06": "Microbiological Phenomena",
-    "G07": "Physiological Phenomena",
-    "G16": "Biological Phenomena",
-}
-
-# Generic MeSH terms that are too broad to be useful — we skip these
-# and try the next candidate keyword from the cluster instead
-GENERIC_MESH_TERMS = {
-    "analysis", "methods", "technique", "techniques", "procedure", "procedures",
-    "study", "studies", "research", "test", "tests", "testing", "assay", "assays",
-    "measurement", "evaluation", "assessment", "review", "overview", "introduction",
-    "general", "other", "miscellaneous", "various", "multiple", "combined",
-    "biological", "clinical", "medical", "scientific", "laboratory",
-}
-
-MESH_CACHE = {}
-NCBI_BASE  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-
-
-def _tree_to_category(tree: str) -> str:
-    """Map a MeSH tree number to a human-readable category."""
-    if not tree:
-        return None
-    prefix3 = tree[:3]
-    prefix1 = tree[:1]
-    return DISEASE_SUBTREES.get(prefix3,
-           MESH_TREE_MAP.get(prefix1, None))
-
-
-def _fetch_mesh_descriptor(uid: str) -> dict:
-    """
-    Fetch full MeSH descriptor for a single UID via efetch (XML).
-    Returns preferred term, scope note, and all tree numbers.
-    This is more reliable than esummary for getting tree numbers.
-    """
-    result = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
-    try:
-        fetch_url = (
-            f"{NCBI_BASE}efetch.fcgi?db=mesh&id={uid}&retmode=json&rettype=full"
-        )
-        r = requests.get(fetch_url, timeout=10)
-        # efetch for MeSH returns XML-like text; fall back to esummary for JSON
-        sum_url = f"{NCBI_BASE}esummary.fcgi?db=mesh&id={uid}&retmode=json"
-        r2      = requests.get(sum_url, timeout=10)
-        summary = r2.json().get("result", {}).get(uid, {})
-
-        # ── Preferred term: use ds_name (the actual descriptor name) not ds_meshterms
-        #    ds_name is the canonical MeSH heading; ds_meshterms are entry terms/synonyms
-        name = summary.get("ds_name", "")
-        if name:
-            result["mesh_term"] = name
-
-        # ── Tree numbers: try multiple field names NCBI uses inconsistently
-        tree_nums = (
-            summary.get("ds_treenums")        # list
-            or summary.get("ds_treenum")       # sometimes singular
-            or []
-        )
-        # Sometimes comes back as a comma-delimited string
-        if isinstance(tree_nums, str):
-            tree_nums = [t.strip() for t in tree_nums.split(",") if t.strip()]
-
-        if tree_nums:
-            # Pick the most specific tree number (longest prefix = most specific)
-            tree_nums_sorted = sorted(tree_nums, key=len, reverse=True)
-            result["mesh_tree"] = tree_nums_sorted[0]
-            # Try each tree num for category; pick first non-None
-            for t in tree_nums_sorted:
-                cat = _tree_to_category(t)
-                if cat:
-                    result["mesh_category"] = cat
-                    break
-
-        # ── Fallback: derive category from ds_idxlinks if still no category
-        if not result["mesh_category"] and result["mesh_term"]:
-            # Use the first letter of the tree numbers available in idxlinks
-            idxlinks = summary.get("ds_idxlinks", "")
-            for char in idxlinks:
-                if char.isalpha() and char.isupper():
-                    cat = MESH_TREE_MAP.get(char)
-                    if cat:
-                        result["mesh_category"] = cat
-                        break
-
-    except Exception:
-        pass
-    return result
-
-
-def _query_mesh_single(term: str) -> dict:
-    """
-    Search MeSH for a single term. Returns descriptor dict or empty result.
-    Skips results where the matched descriptor name is a generic/useless term.
-    """
-    empty = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
-    try:
-        search_url = (
-            f"{NCBI_BASE}esearch.fcgi?db=mesh"
-            f"&term={requests.utils.quote(term + '[MeSH Terms]')}"
-            f"&retmax=3&retmode=json"
-        )
-        r    = requests.get(search_url, timeout=10)
-        ids  = r.json().get("esearchresult", {}).get("idlist", [])
-
-        if not ids:
-            # Retry without field tag for broader match
-            search_url2 = (
-                f"{NCBI_BASE}esearch.fcgi?db=mesh"
-                f"&term={requests.utils.quote(term)}"
-                f"&retmax=3&retmode=json"
-            )
-            r   = requests.get(search_url2, timeout=10)
-            ids = r.json().get("esearchresult", {}).get("idlist", [])
-
-        if not ids:
-            return empty
-
-        # Try each returned UID; skip if the matched term is too generic
-        for uid in ids:
-            desc = _fetch_mesh_descriptor(uid)
-            matched = (desc.get("mesh_term") or "").lower()
-            if matched and matched not in GENERIC_MESH_TERMS:
-                return desc
-
-        return empty
-
-    except Exception:
-        return empty
-
-
-def query_mesh_for_cluster(cluster_keywords: list) -> dict:
-    """
-    Query MeSH using multiple keywords from the cluster, not just the centroid.
-
-    Strategy:
-      1. Try the centroid keyword first (most representative)
-      2. If result is generic/empty, try the next most frequent keywords
-      3. Accept the first result that returns a specific, non-generic MeSH term
-      4. Fall back to category-only if a tree letter can be inferred
-
-    This fixes both issues:
-      - Generic centroid keywords (e.g. "assay") no longer poison the result
-      - More cluster keywords = more chances to find a valid MeSH mapping
-    """
-    cache_key = cluster_keywords[0] if cluster_keywords else ""
-    if cache_key in MESH_CACHE:
-        return MESH_CACHE[cache_key]
-
-    empty = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
-
-    # Try each keyword in order; stop at first good result
-    candidates = cluster_keywords[:6]  # try up to 6 keywords per cluster
-    best = empty
-
-    for kw in candidates:
-        kw_clean = kw.strip().lower()
-        if not kw_clean or kw_clean in GENERIC_MESH_TERMS:
-            continue
-
-        result = _query_mesh_single(kw_clean)
-        time.sleep(0.34)  # ~3 req/sec NCBI rate limit
-
-        if result["mesh_term"] and result["mesh_term"].lower() not in GENERIC_MESH_TERMS:
-            if result["mesh_category"]:
-                # Full hit — term + category. Best possible result, stop here.
-                MESH_CACHE[cache_key] = result
-                return result
-            elif result["mesh_term"]:
-                # Partial hit — term without category. Keep looking but store as fallback.
-                if not best["mesh_term"]:
-                    best = result
-
-    # Return best partial result found, or empty
-    MESH_CACHE[cache_key] = best
-    return best
-
-
-def map_clusters_to_mesh(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    For each cluster, query MeSH using the top keywords from that cluster
-    (not just the single centroid label). This dramatically improves match quality.
-    """
-    print("\n[5/6] Mapping clusters to MeSH taxonomy (NCBI free API)...")
-    print("      Querying up to 6 keywords per cluster for best match quality...")
-    print("      Rate limited to ~3 req/sec per NCBI policy\n")
-
-    # Build per-cluster keyword list (centroid first, then others)
-    cluster_kw_map = {}
-    for cid, group in df.groupby("cluster_id"):
-        label      = group["cluster_label"].iloc[0]
-        other_kws  = group["keyword"].tolist()
-        # Put the centroid label first, then the rest of the cluster keywords
-        all_kws    = [label] + [k for k in other_kws if k != label]
-        cluster_kw_map[cid] = all_kws
-
-    mesh_results = {}
-    cluster_ids  = sorted(cluster_kw_map.keys())
-
-    for i, cid in enumerate(cluster_ids):
-        label = df[df["cluster_id"] == cid]["cluster_label"].iloc[0]
-        print(f"      [{i+1}/{len(cluster_ids)}] Cluster: '{label}'", end="\r")
-        mesh_results[cid] = query_mesh_for_cluster(cluster_kw_map[cid])
-
-    print()
-
-    df["mesh_term"]     = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_term"))
-    df["mesh_tree"]     = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_tree"))
-    df["mesh_category"] = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_category"))
-
-    # Report coverage
-    mapped   = df["mesh_term"].notna().sum()
-    categd   = df["mesh_category"].notna().sum()
-    print(f"      → MeSH term found:     {df['cluster_id'].map(lambda x: mesh_results.get(x,{}).get('mesh_term')).notna().sum()} / {len(cluster_ids)} clusters")
-    print(f"      → MeSH category found: {df['cluster_id'].map(lambda x: mesh_results.get(x,{}).get('mesh_category')).notna().sum()} / {len(cluster_ids)} clusters")
+    # t-SNE for visualization
+    print("    → Running t-SNE...")
+    perp = min(30, max(5, n // 10))
+    tsne = TSNE(n_components=2, perplexity=perp,
+                learning_rate="auto", init="pca", random_state=42)
+    xy   = tsne.fit_transform(reduced)
+    df["tsne_x"] = xy[:, 0]
+    df["tsne_y"] = xy[:, 1]
 
     return df
 
 
-# ─────────────────────────────────────────────
-# 6. SCORE & RECOMMEND RESEARCH AREAS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 5. SCORE & RECOMMEND
+# ═══════════════════════════════════════════════════════════════════════
 
-def score_and_recommend(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
     """
-    Aggregate clusters into research area recommendations.
+    Aggregate keyword-level assignments into research area scores.
 
-    Scoring dimensions (all normalized 0–1):
-      - Volume Score : cluster size (keyword count) as proxy for demand breadth
-      - MeSH Score   : bonus if a confirmed MeSH mapping exists (validated topic)
+    Opportunity Score = 70% keyword count (breadth) + 30% avg similarity (depth)
 
-    If you later add GSC/SEMrush volume data, replace keyword_count with real search volume.
+    Sub-topics show the most common cluster labels within each area,
+    giving content creators a starting point for article angles.
     """
-    print("\n[6/6] Scoring clusters and generating recommendations...")
+    print("\n[5/5] Scoring research areas...")
 
-    # Use all rows — Agglomerative never produces -1, but keep the filter
-    # as a safety net in case of future clusterer swaps
-    working = df[df["cluster_id"] != -1].copy()
+    work = df[df["research_area"] != "Unclassified / General Methods"].copy()
 
-    if working.empty:
-        # Safety fallback: if somehow everything was marked noise, use all rows
-        print("    ⚠ All points were noise — using full dataset as fallback")
-        working = df.copy()
-
-    # One representative MeSH term per cluster (take first non-null)
-    mesh_lookup = (
-        working[working["mesh_term"].notna()]
-        .groupby("cluster_id")[["mesh_term", "mesh_category"]]
-        .first()
-        .reset_index()
-    )
-
-    cluster_df = (
-        working
-        .groupby(["cluster_id", "cluster_label"])
+    area_df = (
+        work.groupby("research_area")
         .agg(
             keyword_count   = ("keyword", "count"),
-            sample_keywords = ("keyword", lambda x: " | ".join(list(x)[:8]))
+            avg_similarity  = ("research_area_score", "mean"),
+            sample_keywords = ("keyword", lambda x: " | ".join(list(x)[:10])),
+            sub_topics      = ("cluster_label", lambda x: " · ".join(
+                                x.value_counts().head(5).index.tolist()))
         )
         .reset_index()
-        .merge(mesh_lookup, on="cluster_id", how="left")
     )
 
-    # Normalize keyword count (volume proxy) 0–1
-    max_count = cluster_df["keyword_count"].max()
-    cluster_df["volume_score"] = cluster_df["keyword_count"] / max_count
-
-    # MeSH validation bonus: +0.3 if a MeSH term was found
-    cluster_df["mesh_score"] = cluster_df["mesh_term"].notna().astype(float) * 0.3
-
-    # Composite opportunity score
-    cluster_df["opportunity_score"] = (
-        cluster_df["volume_score"] * 0.6 +
-        cluster_df["mesh_score"]   * 0.4
+    max_count = area_df["keyword_count"].max()
+    area_df["count_score"]       = area_df["keyword_count"] / max_count
+    area_df["opportunity_score"] = (
+        area_df["count_score"]   * 0.70 +
+        area_df["avg_similarity"] * 0.30
     ).round(3)
 
-    # Priority tier
-    def tier(score):
-        if score >= 0.6:  return "🔴 High Priority"
-        if score >= 0.35: return "🟡 Medium Priority"
-        return              "🟢 Explore / Monitor"
+    def tier(s):
+        if s >= 0.55: return "🔴 High Priority"
+        if s >= 0.30: return "🟡 Medium Priority"
+        return                "🟢 Explore / Monitor"
 
-    cluster_df["priority"] = cluster_df["opportunity_score"].apply(tier)
+    area_df["priority"] = area_df["opportunity_score"].apply(tier)
 
-    # Sort and take top N
-    recs = cluster_df.sort_values("opportunity_score", ascending=False).head(top_n)
-    recs = recs.reset_index(drop=True)
-    recs.index += 1  # 1-based rank
+    recs = (
+        area_df
+        .sort_values("opportunity_score", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    recs.index     += 1
     recs.index.name = "rank"
 
-    print(f"    → Top {top_n} research area recommendations generated")
-    return cluster_df, recs
+    print(f"    → {len(area_df)} research areas scored")
+    return area_df, recs
 
 
-# ─────────────────────────────────────────────
-# 7. HTML REPORT
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 6. HTML REPORT
+# ═══════════════════════════════════════════════════════════════════════
 
 def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
-    """Generate a standalone HTML report with an interactive UMAP scatter plot."""
     print("\n    → Generating HTML report...")
 
     try:
         import plotly.express as px
         import plotly.io as pio
 
-        plot_df = df[df["cluster_id"] != -1].copy() if (df["cluster_id"] == -1).any() else df.copy()
-        plot_df["label_display"] = plot_df["cluster_label"].str.title()
-
         fig = px.scatter(
-            plot_df,
-            x="umap_x", y="umap_y",
-            color="cluster_label",
-            hover_data=["keyword", "mesh_term", "mesh_category"],
-            title="Keyword Cluster Map — Life Science Research Areas",
-            labels={"umap_x": "t-SNE 1", "umap_y": "t-SNE 2"},
-            height=700,
-            template="plotly_white"
+            df, x="tsne_x", y="tsne_y",
+            color="research_area",
+            hover_data=["keyword", "cluster_label", "research_area_score"],
+            title="Keyword Map — Coloured by Research Area",
+            labels={"tsne_x": "t-SNE 1", "tsne_y": "t-SNE 2",
+                    "research_area": "Research Area"},
+            height=750, template="plotly_white"
         )
-        fig.update_traces(marker=dict(size=6, opacity=0.75))
-        fig.update_layout(legend_title_text="Cluster", showlegend=True)
-
+        fig.update_traces(marker=dict(size=5, opacity=0.75))
+        fig.update_layout(legend=dict(orientation="v", x=1.02, y=1))
         scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
     except ImportError:
-        scatter_html = "<p><em>Install plotly for interactive visualization: pip install plotly</em></p>"
+        scatter_html = "<p><em>pip install plotly for interactive chart</em></p>"
 
-    # Build recommendations table HTML
     rec_rows = ""
     for rank, row in recs.iterrows():
         rec_rows += f"""
         <tr>
-          <td style='text-align:center'><strong>{rank}</strong></td>
-          <td><strong>{str(row['cluster_label']).title()}</strong></td>
-          <td>{row.get('mesh_term') or '—'}</td>
-          <td>{row.get('mesh_category') or '—'}</td>
+          <td style='text-align:center;font-weight:700'>{rank}</td>
+          <td><strong>{row['research_area']}</strong></td>
           <td style='text-align:center'>{row['keyword_count']}</td>
+          <td style='text-align:center'>{row['avg_similarity']:.3f}</td>
           <td style='text-align:center'>{row['opportunity_score']:.3f}</td>
           <td>{row['priority']}</td>
-          <td style='font-size:0.85em;color:#555'>{row['sample_keywords']}</td>
+          <td style='font-size:0.82em;color:#444'>{row.get('sub_topics','')}</td>
+          <td style='font-size:0.82em;color:#777'>{row['sample_keywords']}</td>
         </tr>"""
+
+    unclass     = df[df["research_area"] == "Unclassified / General Methods"]
+    unclass_kws = " &nbsp;·&nbsp; ".join(unclass["keyword"].head(50).tolist())
+    unclass_html = f"""
+    <h2>⚪ Unclassified / General Methods ({len(unclass)} keywords)</h2>
+    <div style='background:white;border-radius:10px;padding:16px;
+                box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:0.86em;color:#555;
+                line-height:1.8'>
+      {unclass_kws}{'&nbsp;·&nbsp;<em>...and more</em>' if len(unclass)>50 else ''}
+    </div>""" if len(unclass) else ""
+
+    n_areas   = (df["research_area"] != "Unclassified / General Methods").sum()
+    n_areas_u = df["research_area"].nunique() - (1 if len(unclass) else 0)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Life Science Keyword Cluster Report</title>
+  <title>Life Science Research Area Report</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            margin: 0; padding: 20px 40px; background: #f8f9fa; color: #212529; }}
-    h1   {{ color: #1a1a2e; border-bottom: 3px solid #4361ee; padding-bottom: 10px; }}
-    h2   {{ color: #4361ee; margin-top: 40px; }}
-    .stats {{ display: flex; gap: 20px; flex-wrap: wrap; margin: 20px 0; }}
-    .stat-card {{ background: white; border-radius: 10px; padding: 16px 24px;
-                  box-shadow: 0 2px 8px rgba(0,0,0,.08); min-width: 140px; }}
-    .stat-card .num  {{ font-size: 2em; font-weight: 700; color: #4361ee; }}
-    .stat-card .lbl  {{ font-size: 0.85em; color: #6c757d; margin-top: 4px; }}
-    table {{ width: 100%; border-collapse: collapse; background: white;
-             border-radius: 10px; overflow: hidden;
-             box-shadow: 0 2px 8px rgba(0,0,0,.08); }}
-    th    {{ background: #4361ee; color: white; padding: 12px 10px;
-             text-align: left; font-size: 0.88em; }}
-    td    {{ padding: 10px; border-bottom: 1px solid #e9ecef; font-size: 0.9em; }}
-    tr:hover td {{ background: #f0f4ff; }}
-    .plot-wrap {{ background: white; border-radius: 10px; padding: 20px;
-                  box-shadow: 0 2px 8px rgba(0,0,0,.08); margin: 20px 0; }}
-    .note {{ background: #fff3cd; border-left: 4px solid #ffc107;
-             padding: 12px 16px; border-radius: 4px; margin: 20px 0;
-             font-size: 0.9em; }}
+    body   {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+             margin:0;padding:24px 44px;background:#f0f4f8;color:#212529; }}
+    h1     {{ color:#0d1b2a;border-bottom:3px solid #0077b6;padding-bottom:10px; }}
+    h2     {{ color:#0077b6;margin-top:36px; }}
+    .stats {{ display:flex;gap:16px;flex-wrap:wrap;margin:20px 0; }}
+    .card  {{ background:white;border-radius:10px;padding:14px 22px;
+             box-shadow:0 2px 8px rgba(0,0,0,.08);min-width:130px; }}
+    .card .num {{ font-size:1.9em;font-weight:700;color:#0077b6; }}
+    .card .lbl {{ font-size:0.82em;color:#6c757d;margin-top:3px; }}
+    table  {{ width:100%;border-collapse:collapse;background:white;
+             border-radius:10px;overflow:hidden;
+             box-shadow:0 2px 8px rgba(0,0,0,.08); }}
+    th     {{ background:#0077b6;color:white;padding:11px 10px;
+             text-align:left;font-size:0.86em; }}
+    td     {{ padding:10px;border-bottom:1px solid #e9ecef;font-size:0.88em; }}
+    tr:hover td {{ background:#e8f4fd; }}
+    .plot  {{ background:white;border-radius:10px;padding:16px;
+             box-shadow:0 2px 8px rgba(0,0,0,.08);margin:16px 0; }}
+    .note  {{ background:#d1ecf1;border-left:4px solid #0077b6;
+             padding:12px 16px;border-radius:4px;margin:16px 0;font-size:0.88em; }}
   </style>
 </head>
 <body>
-  <h1>🔬 Life Science Keyword Cluster Report</h1>
+  <h1>🔬 Life Science Research Area Recommendations</h1>
 
   <div class="stats">
-    <div class="stat-card"><div class="num">{len(df)}</div><div class="lbl">Total Keywords</div></div>
-    <div class="stat-card"><div class="num">{df['cluster_id'].nunique()}</div><div class="lbl">Clusters Found</div></div>
-    <div class="stat-card"><div class="num">{int((df['cluster_id']==-1).sum())}</div><div class="lbl">Noise / Unclustered</div></div>
-    <div class="stat-card"><div class="num">{int(df['mesh_term'].notna().sum())}</div><div class="lbl">MeSH Mapped</div></div>
+    <div class="card"><div class="num">{len(df)}</div><div class="lbl">Total Keywords</div></div>
+    <div class="card"><div class="num">{n_areas_u}</div><div class="lbl">Research Areas Hit</div></div>
+    <div class="card"><div class="num">{n_areas}</div><div class="lbl">Classified Keywords</div></div>
+    <div class="card"><div class="num">{len(unclass)}</div><div class="lbl">Unclassified</div></div>
+    <div class="card"><div class="num">{df['cluster_id'].nunique()}</div><div class="lbl">Sub-topic Clusters</div></div>
   </div>
 
   <div class="note">
-    <strong>Scoring note:</strong> Opportunity Score is currently based on cluster size (keyword breadth) + MeSH validation.
-    To upgrade scoring, merge in real search volume from GSC/SEMrush before running the pipeline — the scorer will automatically use it.
+    <strong>How to read this:</strong> Research areas come from a predefined life science taxonomy
+    ({len(RESEARCH_AREAS)} areas). Every keyword is matched via semantic similarity — output is
+    always a meaningful disease/research area, never a lab technique.
+    <strong>Opportunity Score</strong> = 70% keyword count + 30% avg similarity strength.
+    <strong>Sub-topics</strong> show the key themes within each area to guide content angles.
   </div>
 
-  <h2>📊 Interactive Cluster Map</h2>
-  <div class="plot-wrap">{scatter_html}</div>
+  <h2>📊 Keyword Map by Research Area</h2>
+  <div class="plot">{scatter_html}</div>
 
-  <h2>🎯 Top Research Area Recommendations</h2>
+  <h2>🎯 Research Area Recommendations</h2>
   <table>
     <thead>
       <tr>
-        <th>#</th><th>Research Area</th><th>MeSH Term</th><th>MeSH Category</th>
-        <th>Keyword Count</th><th>Opp. Score</th><th>Priority</th><th>Sample Keywords</th>
+        <th>#</th><th>Research Area</th><th>Keywords</th>
+        <th>Avg Similarity</th><th>Opp. Score</th><th>Priority</th>
+        <th>Key Sub-topics</th><th>Sample Keywords</th>
       </tr>
     </thead>
     <tbody>{rec_rows}</tbody>
   </table>
 
-  <p style="margin-top:40px;color:#aaa;font-size:0.8em">
-    Generated by lifesci_keyword_pipeline.py — 
-    Embeddings: all-MiniLM-L6-v2 | Reduction: TruncatedSVD + t-SNE | Clustering: OPTICS | Taxonomy: NCBI MeSH
+  {unclass_html}
+
+  <p style="margin-top:40px;color:#aaa;font-size:0.78em">
+    Model: all-MiniLM-L6-v2 &nbsp;|&nbsp;
+    {len(RESEARCH_AREAS)} taxonomy areas &nbsp;|&nbsp;
+    Agglomerative clustering + t-SNE
   </p>
 </body>
 </html>"""
@@ -701,69 +636,54 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
     print(f"    → Report saved: {path}")
 
 
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
 
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # ── 1. Load
-    df = load_keywords(args.input, args.col)
+    df                  = load_keywords(args.input, args.col)
+    kw_emb, area_emb   = embed_all(df)
+    df                  = map_to_research_areas(df, kw_emb, area_emb, args.threshold)
+    df                  = cluster_keywords(df, kw_emb, args.min_cluster_size)
+    area_df, recs       = score_and_recommend(df, args.top_n)
 
-    # ── 2. Embed
-    embeddings = embed_keywords(df)
-
-    # ── 3. Cluster
-    df = cluster_keywords(df, embeddings, args.min_cluster_size)
-
-    # ── 4. Label
-    df = label_clusters(df, embeddings)
-
-    # ── 5. MeSH map
-    df = map_clusters_to_mesh(df)
-
-    # ── 6. Score
-    cluster_df, recs = score_and_recommend(df, args.top_n)
-
-    # ── 7. Save outputs
     clusters_path = os.path.join(args.output, "clusters.csv")
     recs_path     = os.path.join(args.output, "recommendations.csv")
 
-    df.drop(columns=["umap_x", "umap_y"], errors="ignore").to_csv(clusters_path, index=False)
+    df.drop(columns=["tsne_x", "tsne_y"], errors="ignore").to_csv(clusters_path, index=False)
     recs.to_csv(recs_path)
     generate_report(df, recs, args.output)
 
-    print("\n" + "═"*60)
+    print("\n" + "═"*62)
     print("✅  Pipeline complete!")
     print(f"   clusters.csv        → {clusters_path}")
     print(f"   recommendations.csv → {recs_path}")
     print(f"   report.html         → {os.path.join(args.output, 'report.html')}")
-    print("═"*60)
+    print("═"*62)
+    print("\n📋  Research Area Recommendations:\n")
+    print(recs[["research_area", "keyword_count", "avg_similarity",
+                "opportunity_score", "priority"]].to_string())
 
-    print("\n📋  Top 10 Research Area Recommendations:")
-    print(recs[["cluster_label","mesh_category","keyword_count",
-                "opportunity_score","priority"]].head(10).to_string())
 
-
-# ─────────────────────────────────────────────
-# OPTIONAL: Add search volume from GSC / SEMrush
-# ─────────────────────────────────────────────
-# If you have a CSV with columns [keyword, volume], call this BEFORE score_and_recommend():
+# ═══════════════════════════════════════════════════════════════════════
+# OPTIONAL: Plug in GSC / SEMrush search volume
+# ═══════════════════════════════════════════════════════════════════════
+# 1. Before map_to_research_areas(), merge your volume data:
+#      vol = pd.read_csv("volumes.csv")   # columns: keyword, volume
+#      df  = df.merge(vol, on="keyword", how="left")
+#      df["volume"] = df["volume"].fillna(0)
 #
-#   volume_df = pd.read_csv("volumes.csv")   # columns: keyword, volume
-#   df = df.merge(volume_df, on="keyword", how="left")
-#   df["volume"] = df["volume"].fillna(0)
+# 2. In score_and_recommend(), add to the groupby agg:
+#      total_volume = ("volume", "sum")
 #
-# Then in score_and_recommend(), replace:
-#   cluster_df["volume_score"] = cluster_df["keyword_count"] / max_count
-# with:
-#   cluster_df["total_volume"] = df.groupby("cluster_id")["volume"].sum().values
-#   cluster_df["volume_score"] = cluster_df["total_volume"] / cluster_df["total_volume"].max()
+# 3. Replace count_score with:
+#      area_df["count_score"] = area_df["total_volume"] / area_df["total_volume"].max()
 #
-# This makes the opportunity score reflect real search demand. ─────────────────────────────────────────────
-
+# This makes Opportunity Score reflect real search demand rather than keyword count.
+# ═══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     main()
