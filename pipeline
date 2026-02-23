@@ -377,28 +377,77 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
 
 def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Concatenate keyword with up to 3 SERP result titles.
-    If SERP titles are missing, fall back to keyword alone.
-    The enriched text is what gets embedded — it bakes in Google's
-    interpretation of the keyword's informational context.
+    Two modes depending on what your SERP CSV contains:
+
+    MODE A — Pre-built from BigQuery (preferred):
+      If your serp_data.csv already has an 'enriched_text' column
+      (keyword + all page-2 titles concatenated in BQ), use it directly.
+      Also uses 'all_paa_questions' column if present.
+
+    MODE B — Build from wide columns (fallback):
+      If your CSV has title_1, title_2 ... title_N columns, concatenates
+      ALL of them (no 3-title cap) plus all paa_1 ... paa_N columns.
+
+    The enriched_text is what gets embedded — it encodes Google's full
+    interpretation of each keyword across up to 20 organic results.
     """
     print("\n[2/8] Enriching keywords with SERP titles...")
 
-    title_cols = [c for c in df.columns if re.match(r"title_\d+", c)]
+    # ── MODE A: pre-built enriched_text column from BigQuery
+    if "enriched_text" in df.columns:
+        # Fill any blanks with bare keyword
+        df["enriched_text"] = df.apply(
+            lambda row: row["enriched_text"]
+            if pd.notna(row["enriched_text"]) and str(row["enriched_text"]).strip()
+            else row["keyword"],
+            axis=1
+        )
+        enriched = (df["enriched_text"].str.count(r"\|") > 0).sum()
+        print(f"    → Using pre-built enriched_text column (BigQuery mode)")
+        print(f"    → {enriched}/{len(df)} keywords have SERP title context")
+
+        # PAA: use pre-built all_paa_questions column if present
+        if "all_paa_questions" in df.columns:
+            df["paa_questions"] = df["all_paa_questions"].fillna("")
+            paa_count = (df["paa_questions"].str.strip() != "").sum()
+            print(f"    → {paa_count}/{len(df)} keywords have PAA questions")
+        else:
+            df["paa_questions"] = ""
+
+        return df
+
+    # ── MODE B: build from wide title_N / paa_N columns
+    title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)],
+                        key=lambda c: int(re.search(r"\d+", c).group()))
+    paa_cols   = sorted([c for c in df.columns if re.match(r"paa_\d+",   c)],
+                        key=lambda c: int(re.search(r"\d+", c).group()))
+
+    print(f"    → Building from {len(title_cols)} title columns + {len(paa_cols)} PAA columns")
 
     def build_text(row):
         parts = [str(row["keyword"])]
-        for col in title_cols[:3]:
+        for col in title_cols:          # ALL title columns, no cap
             val = row.get(col, "")
             if pd.notna(val) and str(val).strip():
                 parts.append(str(val).strip())
         return " | ".join(parts)
 
-    df["enriched_text"] = df.apply(build_text, axis=1)
+    def build_paa(row):
+        questions = []
+        for col in paa_cols:            # ALL PAA columns, no cap
+            val = row.get(col, "")
+            if pd.notna(val) and str(val).strip():
+                questions.append(str(val).strip())
+        return " | ".join(questions)
 
-    enriched = (df["enriched_text"].str.count(r"\|") > 0).sum()
+    df["enriched_text"] = df.apply(build_text, axis=1)
+    df["paa_questions"]  = df.apply(build_paa,  axis=1)
+
+    enriched  = (df["enriched_text"].str.count(r"\|") > 0).sum()
+    paa_count = (df["paa_questions"].str.strip() != "").sum()
     print(f"    → {enriched}/{len(df)} keywords enriched with SERP titles")
     print(f"    → {len(df)-enriched} keywords using bare keyword only")
+    print(f"    → {paa_count}/{len(df)} keywords have PAA questions")
     return df
 
 
@@ -639,8 +688,6 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
     """
     print("\n[7/8] Running gap analysis...")
 
-    paa_cols = sorted([c for c in df.columns if re.match(r"paa_\d+", c)])
-
     # ── CTR
     df["ctr"] = np.where(
         df["impressions"] > 0,
@@ -666,21 +713,12 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
         (df["position"] > 10)
     )
 
-    # ── PAA gap: questions exist for this keyword, you're not in top 10
-    has_paa = pd.Series(False, index=df.index)
-    for col in paa_cols[:3]:
-        has_paa = has_paa | (
-            df[col].notna() & (df[col].astype(str).str.strip() != "")
-        )
+    # ── PAA gap: uses pre-built paa_questions column from enrich_text stage
+    #    (covers all PAA questions from BQ or all paa_N columns — no cap)
+    if "paa_questions" not in df.columns:
+        df["paa_questions"] = ""
 
-    df["paa_questions"] = (
-        df[paa_cols].apply(
-            lambda row: " | ".join(
-                str(v) for v in row if pd.notna(v) and str(v).strip()
-            ), axis=1
-        ) if paa_cols else pd.Series("", index=df.index)
-    )
-
+    has_paa = df["paa_questions"].str.strip() != ""
     df["gap_paa"] = has_paa & (df["position"] > 10)
 
     # ── Snippet gap: snippet exists but you don't own it
@@ -851,9 +889,20 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
     else:
         area_df["demand_score"] = area_df["keyword_count"] / area_df["keyword_count"].max()
 
-    # ── Winnability: low academic lock + high SERP diversity = accessible
+    # ── Winnability: rescale serp_diversity to 0-1 first, then combine with academic lock
+    # serp_diversity raw range is ~0.33-1.0 (min 1 distinct / 3 titles)
+    # rescaling ensures winnability can actually reach 1.0
+    sd_min = area_df["avg_serp_diversity"].min()
+    sd_max = area_df["avg_serp_diversity"].max()
+    if sd_max > sd_min:
+        area_df["avg_serp_diversity_scaled"] = (
+            (area_df["avg_serp_diversity"] - sd_min) / (sd_max - sd_min)
+        )
+    else:
+        area_df["avg_serp_diversity_scaled"] = 0.5
+
     area_df["winnability"] = (
-        (1 - area_df["avg_academic_lock"]) * area_df["avg_serp_diversity"]
+        (1 - area_df["avg_academic_lock"]) * area_df["avg_serp_diversity_scaled"]
     ).clip(0, 1).round(3)
 
     # ── Opportunity score
@@ -910,7 +959,8 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 # 9. HTML REPORT
 # ═══════════════════════════════════════════════════════════════════════
 
-def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
+def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
+                    briefs_html: str = ""):
     print("\n    → Generating HTML report...")
 
     # ── Scatter coloured by research area
@@ -918,7 +968,7 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
         import plotly.express as px
         import plotly.io as pio
 
-        hover = ["keyword", "research_area", "primary_gap",
+        hover = ["keyword", "research_area", "research_area_2", "primary_gap",
                  "gap_score", "position", "cluster_label"]
         hover = [c for c in hover if c in df.columns]
 
@@ -1033,10 +1083,14 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
 
   <div class="note">
     <strong>How to read this:</strong>
-    <strong>Absence gap</strong> = zero GSC impressions (no content exists or indexed).
-    <strong>Performance gap</strong> = impressions exist but position &gt;10 or CTR &lt;2%.
-    <strong>Winnability</strong> = domain diversity × (1 − academic lock-in) — higher means easier to compete.
+    <strong>Absence gap</strong> = zero GSC impressions — no content presence at all (weight: 40%).
+    <strong>Performance gap</strong> = impressions exist but position &gt;10 or CTR &lt;2% (weight: 30%).
+    <strong>Format gap</strong> = SERP rewards guides/overviews, academic lock is low, you're not ranking (weight: 15%).
+    <strong>PAA gap</strong> = People Also Ask questions exist but you're not in top 10 (weight: 10%).
+    <strong>Snippet gap</strong> = featured snippet exists that you don't own (weight: 5%).
+    <strong>Winnability</strong> = (1 − academic lock) × SERP diversity — higher means easier to compete.
     <strong>Opportunity Score</strong> = 45% demand + 35% gap score + 20% winnability.
+    Only gaps with score ≥ 0.15 appear in gaps.csv.
   </div>
 
   <h2>📊 Keyword Map</h2>
@@ -1056,6 +1110,8 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
     <tbody>{rec_rows}</tbody>
   </table>
 
+  {briefs_html}
+
   <p style="margin-top:40px;color:#aaa;font-size:0.78em">
     Model: all-MiniLM-L6-v2 &nbsp;|&nbsp;
     {len(RESEARCH_AREAS)} research areas (Tier 1: Neuroscience · Oncology · Immunology) &nbsp;|&nbsp;
@@ -1072,8 +1128,402 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MAIN
+# 9. CONTENT BRIEF GENERATOR
 # ═══════════════════════════════════════════════════════════════════════
+
+# Content type mapping: what format to recommend based on SERP signals
+CONTENT_TYPE_MAP = {
+    "clinical":   "Clinical Deep-Dive",
+    "guide":      "Practical Guide",
+    "overview":   "Educational Overview",
+    "listicle":   "Curated Explainer",
+    "comparison": "Comparative Analysis",
+    "news":       "Research Spotlight",
+    "other":      "Research Overview",
+    "unknown":    "Research Overview",
+}
+
+# Tone guidance based on academic lock score
+def _tone_from_lock(academic_lock: float) -> str:
+    if academic_lock >= 0.7:
+        return "Technical / peer-reviewed depth — audience is active researchers"
+    if academic_lock >= 0.4:
+        return "Balanced — suitable for research-aware professionals and scientists"
+    return "Accessible — suitable for broader scientific and clinical audience"
+
+# Word count guidance based on format and academic lock
+def _wordcount(fmt: str, academic_lock: float) -> str:
+    if fmt == "clinical":
+        return "2,500–3,500"
+    if academic_lock >= 0.6:
+        return "2,000–3,000"
+    if fmt in ("guide", "listicle"):
+        return "1,500–2,500"
+    return "1,800–2,500"
+
+# Title angle generator based on sub-topic and gap type
+def _suggest_title(sub_topic: str, research_area: str, primary_gap: str,
+                   content_type: str, paa_sample: str) -> str:
+    sub = sub_topic.title()
+    area = research_area.split("/")[0].strip()
+
+    if primary_gap == "Absence":
+        return f"{sub}: A {content_type} for {area} Researchers"
+    if primary_gap == "Performance":
+        return f"{sub} — Key Mechanisms, Current Research & Clinical Relevance"
+    if primary_gap == "PAA" and paa_sample:
+        # Use the first PAA question as the title angle
+        q = paa_sample.split("|")[0].strip().rstrip("?")
+        return f"{q}: What the Latest Research Shows"
+    if primary_gap == "Format":
+        return f"Understanding {sub}: A Researcher's Guide"
+    if primary_gap == "Snippet":
+        return f"{sub}: Concise Overview for {area} Professionals"
+    return f"{sub}: Research Overview and Key Insights"
+
+
+def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
+                             recs: pd.DataFrame, output_dir: str,
+                             n_briefs: int = 12) -> pd.DataFrame:
+    """
+    Stage 9: Generate 10-15 prioritised content briefs.
+
+    Approach:
+      1. For each research area (Tier 1 first), cluster keywords WITHIN
+         that area only — gives clean, area-specific sub-topics rather
+         than global clusters that bleed across areas.
+      2. Score each within-area cluster by: gap score, keyword count,
+         PAA richness, and snippet opportunity.
+      3. Select the top n_briefs clusters across all areas, respecting
+         tier weighting so Tier 1 areas aren't crowded out.
+      4. For each selected cluster, build a structured content brief:
+           - Suggested title
+           - Content type (guide/overview/clinical etc.)
+           - Target keywords (primary + secondary)
+           - PAA questions to answer (H2/H3 structure)
+           - Tone and word count guidance
+           - Gap type driving the recommendation
+           - Research area + secondary area if cross-cutting
+    """
+    print("\n[9/9] Generating content briefs...")
+
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import AgglomerativeClustering, KMeans
+    from sklearn.preprocessing import normalize
+    from sklearn.metrics import pairwise_distances_argmin_min
+
+    # Only work with classified, gap-flagged keywords
+    work = df[
+        (df["research_area"] != "Unclassified / General Methods") &
+        (df["gap_score"] >= 0.15)
+    ].copy()
+
+    if len(work) == 0:
+        print("    → No gap keywords above threshold — skipping brief generation")
+        return pd.DataFrame()
+
+    # Build tier lookup
+    tier_lookup = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
+
+    all_briefs = []
+
+    # Process each research area independently
+    areas_ordered = (
+        recs.sort_values(["tier", "opportunity_score"], ascending=[True, False])
+        ["research_area"].tolist()
+    )
+
+    for area in areas_ordered:
+        area_mask = work["research_area"] == area
+        area_df   = work[area_mask].copy()
+
+        if len(area_df) < 3:
+            continue
+
+        # ── Cluster WITHIN this area only
+        area_indices = area_df.index.tolist()
+        area_emb     = kw_emb[area_indices]
+        n            = len(area_df)
+
+        n_comp  = min(30, area_emb.shape[1] - 1, n - 1)
+        reduced = normalize(
+            TruncatedSVD(n_components=n_comp, random_state=42).fit_transform(area_emb)
+        )
+
+        # k: 1 cluster per 6 keywords, bounded 2-15
+        k = max(2, min(15, n // 6))
+
+        if n <= 500:
+            labels = AgglomerativeClustering(
+                n_clusters=k, metric="cosine", linkage="average"
+            ).fit_predict(reduced)
+        else:
+            labels = KMeans(
+                n_clusters=k, random_state=42, n_init="auto"
+            ).fit_predict(reduced)
+
+        area_df = area_df.copy()
+        area_df["area_cluster"] = labels
+
+        # ── Score each within-area cluster
+        for cid in np.unique(labels):
+            cluster_mask = area_df["area_cluster"] == cid
+            cluster      = area_df[cluster_mask]
+
+            if len(cluster) < 2:
+                continue
+
+            # Centroid keyword = cluster label
+            c_emb     = reduced[cluster_mask.values]
+            centroid  = c_emb.mean(axis=0)
+            sims      = c_emb @ centroid
+            label_kw  = cluster["keyword"].iloc[sims.argmax()]
+
+            # Aggregate signals
+            avg_gap      = cluster["gap_score"].mean()
+            kw_count     = len(cluster)
+            primary_gaps = cluster["primary_gap"].value_counts()
+            top_gap      = primary_gaps.index[0] if len(primary_gaps) else "Absence"
+
+            # PAA: collect all unique questions across cluster keywords
+            all_paa = []
+            for paa_str in cluster["paa_questions"].dropna():
+                for q in str(paa_str).split("|"):
+                    q = q.strip()
+                    if q and q not in all_paa:
+                        all_paa.append(q)
+
+            # Dominant format and academic lock
+            fmt_counts = cluster["dominant_format"].value_counts()
+            dom_fmt    = fmt_counts.index[0] if len(fmt_counts) else "other"
+            avg_lock   = cluster["academic_lock"].mean()
+
+            # Snippet opportunity
+            has_snippet = cluster.get("gap_snippet", pd.Series(False)).any()
+
+            # Cross-cutting: check if any keyword has a different research_area_2
+            if "research_area_2" in cluster.columns:
+                area2_counts = cluster["research_area_2"].value_counts()
+                cross_area   = (
+                    area2_counts.index[0]
+                    if len(area2_counts) and area2_counts.index[0] != area
+                    else ""
+                )
+            else:
+                cross_area = ""
+
+            # Brief score: gap weighted by PAA richness and keyword count
+            paa_bonus   = min(0.15, len(all_paa) * 0.015)
+            snippet_bonus = 0.05 if has_snippet else 0.0
+            tier_bonus    = 0.10 if tier_lookup.get(area, 2) == 1 else 0.0
+            brief_score   = avg_gap + paa_bonus + snippet_bonus + tier_bonus
+
+            # Top keywords: by impressions if available, else alphabetical
+            if "impressions" in cluster.columns and cluster["impressions"].sum() > 0:
+                top_kws = (
+                    cluster.sort_values("impressions", ascending=False)
+                    ["keyword"].head(12).tolist()
+                )
+            else:
+                top_kws = cluster["keyword"].head(12).tolist()
+
+            content_type  = CONTENT_TYPE_MAP.get(dom_fmt, "Research Overview")
+            paa_sample    = all_paa[0] if all_paa else ""
+            suggested_title = _suggest_title(
+                label_kw, area, top_gap, content_type, paa_sample
+            )
+
+            all_briefs.append({
+                "brief_score":      round(brief_score, 3),
+                "research_area":    area,
+                "tier":             tier_lookup.get(area, 2),
+                "sub_topic":        label_kw,
+                "cross_area":       cross_area,
+                "suggested_title":  suggested_title,
+                "content_type":     content_type,
+                "primary_gap":      top_gap,
+                "keyword_count":    kw_count,
+                "primary_keyword":  top_kws[0] if top_kws else label_kw,
+                "secondary_keywords": " | ".join(top_kws[1:8]),
+                "all_target_keywords": " | ".join(top_kws),
+                "paa_questions":    " | ".join(all_paa[:8]),
+                "paa_count":        len(all_paa),
+                "tone":             _tone_from_lock(avg_lock),
+                "word_count":       _wordcount(dom_fmt, avg_lock),
+                "academic_lock":    round(avg_lock, 2),
+                "avg_gap_score":    round(avg_gap, 3),
+                "has_snippet_opp":  has_snippet,
+                "recommended_action": (
+                    "🆕 Create"         if top_gap == "Absence"     else
+                    "🔧 Optimise"       if top_gap == "Performance" else
+                    "❓ Add PAA content" if top_gap == "PAA"         else
+                    "📋 Reformat"       if top_gap == "Format"      else
+                    "⭐ Win Snippet"
+                ),
+            })
+
+    if not all_briefs:
+        print("    → No briefs generated — check gap threshold")
+        return pd.DataFrame()
+
+    briefs_df = pd.DataFrame(all_briefs)
+
+    # ── Select top n_briefs, weighted toward Tier 1 areas
+    # Ensure at least 1 brief per area that has data
+    selected = []
+    seen_areas = set()
+
+    # First pass: top brief per area (guaranteed representation)
+    for _, row in (
+        briefs_df.sort_values(["tier", "brief_score"], ascending=[True, False])
+        .iterrows()
+    ):
+        if row["research_area"] not in seen_areas:
+            selected.append(row)
+            seen_areas.add(row["research_area"])
+
+    # Second pass: fill remaining slots with highest scoring remaining briefs
+    used_idx = {id(r) for r in selected}
+    remaining = briefs_df[
+        ~briefs_df.index.isin([
+            i for i, r in briefs_df.iterrows()
+            if any(r.equals(s) for s in selected)
+        ])
+    ].sort_values("brief_score", ascending=False)
+
+    for _, row in remaining.iterrows():
+        if len(selected) >= n_briefs:
+            break
+        selected.append(row)
+
+    briefs_out = (
+        pd.DataFrame(selected)
+        .sort_values(["tier", "brief_score"], ascending=[True, False])
+        .reset_index(drop=True)
+    )
+    briefs_out.index += 1
+    briefs_out.index.name = "brief_rank"
+
+    # ── Save CSV
+    briefs_path = os.path.join(output_dir, "content_briefs.csv")
+    briefs_out.to_csv(briefs_path)
+    print(f"    → {len(briefs_out)} content briefs generated")
+
+    # ── Print summary to terminal
+    print("\n📝  Content Briefs:\n")
+    for rank, row in briefs_out.iterrows():
+        tier_tag = "⭐" if row["tier"] == 1 else "  "
+        print(f"  {rank:>2}. {tier_tag} [{row['research_area']}]")
+        print(f"       {row['suggested_title']}")
+        print(f"       {row['content_type']} · {row['recommended_action']} · "
+              f"{row['keyword_count']} keywords · {row['word_count']} words")
+        if row["paa_count"] > 0:
+            first_q = row["paa_questions"].split("|")[0].strip()
+            print(f"       PAA ({row['paa_count']} Qs): {first_q}...")
+        print()
+
+    return briefs_out
+
+
+def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str):
+    """Add a content briefs section to the HTML report."""
+    if briefs_df is None or len(briefs_df) == 0:
+        return ""
+
+    cards = ""
+    for rank, row in briefs_df.iterrows():
+        tier_badge = (
+            "<span style='background:#0077b6;color:white;border-radius:4px;"
+            "padding:2px 8px;font-size:0.75em;margin-right:6px'>⭐ Tier 1</span>"
+            if row["tier"] == 1 else
+            "<span style='background:#6c757d;color:white;border-radius:4px;"
+            "padding:2px 8px;font-size:0.75em;margin-right:6px'>Tier 2</span>"
+        )
+        cross = (
+            f"<span style='font-size:0.8em;color:#6c757d'>"
+            f"Also relevant: {row['cross_area']}</span><br>"
+            if row.get("cross_area") else ""
+        )
+        paa_items = ""
+        if row.get("paa_questions"):
+            for q in str(row["paa_questions"]).split("|")[:5]:
+                q = q.strip()
+                if q:
+                    paa_items += f"<li style='margin:3px 0'>{q}</li>"
+            paa_items = (
+                f"<div style='margin-top:10px'>"
+                f"<strong style='font-size:0.85em;color:#495057'>PAA Questions to Answer:</strong>"
+                f"<ul style='margin:4px 0 0 0;padding-left:18px;font-size:0.83em;color:#555'>"
+                f"{paa_items}</ul></div>"
+            )
+
+        kws = str(row.get("all_target_keywords", "")).split("|")
+        kw_tags = "".join(
+            f"<span style='background:#e8f4fd;border-radius:3px;padding:2px 6px;"
+            f"font-size:0.78em;margin:2px;display:inline-block'>{k.strip()}</span>"
+            for k in kws[:10] if k.strip()
+        )
+
+        gap_colour = {
+            "Absence":    "#dc3545",
+            "Performance":"#fd7e14",
+            "PAA":        "#0077b6",
+            "Format":     "#6610f2",
+            "Snippet":    "#198754",
+        }.get(row["primary_gap"], "#6c757d")
+
+        cards += f"""
+        <div style='background:white;border-radius:12px;padding:20px 24px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:20px;
+                    border-left:4px solid {gap_colour}'>
+          <div style='display:flex;align-items:flex-start;justify-content:space-between;
+                      flex-wrap:wrap;gap:8px'>
+            <div>
+              {tier_badge}
+              <span style='font-size:0.82em;color:#6c757d'>{row['research_area']}</span>
+              {f"<span style='font-size:0.82em;color:#6c757d'> · {row['cross_area']}</span>" if row.get('cross_area') else ""}
+            </div>
+            <div style='display:flex;gap:8px;flex-wrap:wrap'>
+              <span style='background:{gap_colour};color:white;border-radius:4px;
+                           padding:2px 8px;font-size:0.78em'>{row['primary_gap']} Gap</span>
+              <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
+                           padding:2px 8px;font-size:0.78em'>{row['content_type']}</span>
+              <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
+                           padding:2px 8px;font-size:0.78em'>{row['word_count']} words</span>
+            </div>
+          </div>
+
+          <h3 style='margin:10px 0 4px 0;color:#0d1b2a;font-size:1.05em'>
+            #{rank} {row['suggested_title']}
+          </h3>
+          <div style='font-size:0.83em;color:#6c757d;margin-bottom:10px'>
+            {row['recommended_action']} &nbsp;·&nbsp;
+            {row['keyword_count']} target keywords &nbsp;·&nbsp;
+            Tone: {row['tone']}
+          </div>
+
+          <div style='margin-bottom:8px'>
+            <strong style='font-size:0.85em;color:#495057'>Target Keywords:</strong><br>
+            <div style='margin-top:4px'>{kw_tags}</div>
+          </div>
+
+          {paa_items}
+
+          {"<div style='margin-top:10px;font-size:0.8em;background:#fff3cd;border-radius:4px;padding:6px 10px'>⭐ Featured snippet opportunity exists for this cluster</div>" if row.get('has_snippet_opp') else ""}
+        </div>"""
+
+    return f"""
+  <h2>📝 Content Briefs ({len(briefs_df)} Recommendations)</h2>
+  <div style='margin-bottom:16px;font-size:0.88em;color:#555'>
+    Briefs are ranked by opportunity score within each tier.
+    Border colour indicates primary gap type:
+    <span style='color:#dc3545'>■ Absence</span> &nbsp;
+    <span style='color:#fd7e14'>■ Performance</span> &nbsp;
+    <span style='color:#0077b6'>■ PAA</span> &nbsp;
+    <span style='color:#6610f2'>■ Format</span> &nbsp;
+    <span style='color:#198754'>■ Snippet</span>
+  </div>
+  {cards}"""
 
 def main():
     args = parse_args()
@@ -1091,7 +1541,7 @@ def main():
     # ── Stage 4: Research area mapping
     df = map_research_areas(df, kw_emb, area_emb, args.threshold)
 
-    # ── Stage 5: Sub-topic clustering
+    # ── Stage 5: Sub-topic clustering (global — for t-SNE visualization)
     df = cluster_keywords(df, kw_emb, args.min_cluster)
 
     # ── Stage 6: Competitor landscape
@@ -1103,35 +1553,49 @@ def main():
     # ── Stage 8: Score & recommend
     area_df, recs = score_and_recommend(df, args.top_n)
 
-    # ── Stage 9: Save outputs
-    drop_cols   = ["tsne_x", "tsne_y", "enriched_text"]
+    # ── Stage 9: Content briefs (per-area clustering)
+    briefs_df   = generate_content_briefs(df, kw_emb, recs, args.output, n_briefs=12)
+    briefs_html = generate_briefs_html(briefs_df, args.output)
+
+    # ── Save outputs
+    drop_cols     = ["tsne_x", "tsne_y", "enriched_text"]
     clusters_path = os.path.join(args.output, "clusters.csv")
     gaps_path     = os.path.join(args.output, "gaps.csv")
     recs_path     = os.path.join(args.output, "recommendations.csv")
+    briefs_path   = os.path.join(args.output, "content_briefs.csv")
 
     df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
 
-    gap_cols = ["keyword", "research_area", "cluster_label", "primary_gap",
+    gap_cols = ["keyword", "research_area", "research_area_2", "cluster_label", "primary_gap",
                 "gap_score", "gap_absence", "gap_performance",
                 "gap_format", "gap_paa", "gap_snippet", "paa_questions",
                 "impressions", "clicks", "position", "ctr",
                 "academic_lock", "dominant_format", "serp_diversity"]
     gap_cols = [c for c in gap_cols if c in df.columns]
     (
-        df[df["primary_gap"] != "None"][gap_cols]
+        df[(df["primary_gap"] != "None") & (df["gap_score"] >= 0.15)][gap_cols]
         .sort_values("gap_score", ascending=False)
         .to_csv(gaps_path, index=False)
     )
 
     recs.to_csv(recs_path)
-    generate_report(df, recs, args.output)
+    generate_report(df, recs, args.output, briefs_html=briefs_html)
 
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
     print(f"   clusters.csv        → {clusters_path}")
     print(f"   gaps.csv            → {gaps_path}")
     print(f"   recommendations.csv → {recs_path}")
+    print(f"   content_briefs.csv  → {briefs_path}")
     print(f"   report.html         → {os.path.join(args.output, 'report.html')}")
+    print("═" * 62)
+
+    print("\n📋  Top Research Area Recommendations:\n")
+    show_cols = ["research_area", "keyword_count", "absence_gap_pct",
+                 "performance_gap_pct", "opportunity_score",
+                 "priority", "recommended_action"]
+    show_cols = [c for c in show_cols if c in recs.columns]
+    print(recs[show_cols].to_string())
     print("═" * 62)
 
     print("\n📋  Top Research Area Recommendations:\n")
