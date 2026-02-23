@@ -1,0 +1,1188 @@
+"""
+Life Science Content Gap Analysis Pipeline
+==========================================
+Inputs:
+  --keywords   keywords.csv       : keyword, volume (opt), impressions, clicks, position
+  --serp       serp_data.csv      : keyword, title_1..3, url_1..3, paa_1..3 (opt),
+                                    snippet (opt), date_1..3 (opt)
+  --output     ./output
+
+Outputs:
+  clusters.csv        — every keyword fully enriched + scored
+  gaps.csv            — keywords flagged as specific gap types
+  recommendations.csv — research areas ranked by opportunity
+  report.html         — interactive visual summary
+
+Pipeline stages:
+  1. Load & merge all inputs
+  2. Enrich: keyword + SERP titles → combined embedding text
+  3. Embed enriched text (free local model)
+  4. Map to research area taxonomy (cosine similarity)
+  5. Sub-topic clustering (Agglomerative / KMeans)
+  6. Competitor landscape (domain diversity, academic lock-in)
+  7. Gap analysis (absence, performance, freshness, format, PAA)
+  8. Opportunity scoring & ranking
+  9. Report generation
+
+Dependencies:
+  pip install sentence-transformers scikit-learn pandas numpy plotly tldextract
+"""
+
+import argparse
+import os
+import re
+import warnings
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RESEARCH AREA TAXONOMY
+# ═══════════════════════════════════════════════════════════════════════
+
+RESEARCH_AREAS = [
+
+    # ── TIER 1: Primary research areas ────────────────────────────────
+
+    {
+        "name": "Neuroscience",
+        "tier": 1,
+        "description": (
+            "neuroscience brain neuron synapse neural circuit neurodegeneration "
+            "Alzheimer disease Parkinson disease ALS amyotrophic lateral sclerosis "
+            "multiple sclerosis epilepsy stroke dementia cognitive function memory "
+            "learning plasticity blood brain barrier glia astrocyte microglia "
+            "oligodendrocyte neuroinflammation CNS peripheral nervous system "
+            "axon dendrite action potential neurotransmitter dopamine serotonin "
+            "GABA glutamate acetylcholine optogenetics electrophysiology patch clamp "
+            "fMRI EEG brain imaging connectome neural network pain nociception "
+            "spinal cord sensory motor cortex hippocampus cerebellum thalamus "
+            "neurogenesis synaptic plasticity long-term potentiation LTP "
+            "tau amyloid alpha-synuclein TDP-43 FUS neuronal death "
+            "depression anxiety schizophrenia ADHD autism spectrum disorder"
+        ),
+    },
+
+    {
+        "name": "Oncology",
+        "tier": 1,
+        "description": (
+            "oncology cancer tumor malignancy carcinoma sarcoma lymphoma leukemia "
+            "melanoma metastasis invasion angiogenesis tumor microenvironment "
+            "cancer stem cell clonal evolution drug resistance "
+            "chemotherapy radiation targeted therapy kinase inhibitor "
+            "KRAS EGFR HER2 BRAF ALK RET FGFR PIK3CA PTEN TP53 RB1 "
+            "breast cancer lung cancer colorectal cancer prostate cancer "
+            "ovarian cancer pancreatic cancer glioblastoma GBM hepatocellular "
+            "bladder cancer renal cell carcinoma thyroid cancer "
+            "tumor suppressor oncogene cell proliferation apoptosis senescence "
+            "liquid biopsy ctDNA circulating tumor cell cancer biomarker "
+            "CDK4 CDK6 mTOR VEGF RAF MEK ERK PI3K AKT Wnt Notch Hedgehog "
+            "PARP inhibitor proteasome ubiquitin DNA damage repair homologous recombination"
+        ),
+    },
+
+    {
+        "name": "Immunology",
+        "tier": 1,
+        "description": (
+            "immunology immune system innate immunity adaptive immunity "
+            "T cell B cell NK cell dendritic cell macrophage neutrophil "
+            "monocyte mast cell basophil eosinophil plasma cell "
+            "antibody immunoglobulin IgG IgM IgE IgA "
+            "cytokine interleukin TNF interferon chemokine "
+            "IL-1 IL-2 IL-4 IL-6 IL-10 IL-12 IL-17 IL-23 TGF-beta "
+            "MHC HLA antigen presentation TCR BCR "
+            "CD4 CD8 CD19 CD20 CD28 CTLA-4 PD-1 LAG-3 TIM-3 "
+            "regulatory T cell Treg Th1 Th2 Th17 follicular helper T cell "
+            "germinal center affinity maturation somatic hypermutation "
+            "complement system toll-like receptor NLR inflammasome NLRP3 "
+            "autoimmunity rheumatoid arthritis lupus SLE inflammatory bowel disease "
+            "allergy atopic dermatitis asthma type 1 diabetes multiple sclerosis "
+            "immunosuppression transplant rejection GVHD "
+            "vaccine adjuvant humoral immunity cellular immunity memory"
+        ),
+    },
+
+    # ── TIER 2: Secondary research areas ──────────────────────────────
+
+    {
+        "name": "Immuno-Oncology",
+        "tier": 2,
+        "description": (
+            "immuno-oncology cancer immunotherapy immune checkpoint "
+            "PD-1 PD-L1 CTLA-4 LAG-3 TIM-3 TIGIT checkpoint blockade "
+            "CAR-T cell therapy chimeric antigen receptor adoptive cell therapy "
+            "tumor infiltrating lymphocyte TIL natural killer cell NK cell therapy "
+            "bispecific antibody T cell engager BiTE blinatumomab "
+            "tumor microenvironment immunosuppression myeloid derived suppressor "
+            "cancer vaccine neoantigen personalized immunotherapy "
+            "anti-tumor immunity immune evasion antigen presentation MHC "
+            "response rate overall survival progression free survival "
+            "combination therapy anti-PD1 anti-CTLA4 nivolumab pembrolizumab "
+            "ipilimumab atezolizumab durvalumab avelumab cemiplimab "
+            "cytokine release syndrome immune related adverse events irAE "
+            "solid tumor hematologic malignancy melanoma NSCLC renal cell "
+            "MSI-H TMB tumor mutational burden dMMR mismatch repair"
+        ),
+    },
+
+    {
+        "name": "Immunology & Infectious Disease",
+        "tier": 2,
+        "description": (
+            "infectious disease host immune response pathogen infection "
+            "bacteria virus fungus parasite antimicrobial resistance "
+            "HIV AIDS influenza SARS-CoV-2 COVID-19 tuberculosis TB "
+            "malaria dengue Zika Ebola RSV hepatitis sepsis bacteremia "
+            "antibiotic resistance AMR MRSA carbapenem-resistant "
+            "innate immune response pattern recognition receptor "
+            "toll-like receptor TLR NOD-like receptor inflammasome "
+            "interferon antiviral response NK cell macrophage activation "
+            "vaccine efficacy adjuvant mucosal immunity IgA neutralizing antibody "
+            "microbiome gut flora dysbiosis colonization resistance "
+            "antifungal antiviral antiparasitic treatment "
+            "epidemiology outbreak transmission zoonotic spillover "
+            "T cell response CD8 cytotoxic lymphocyte viral clearance "
+            "humoral immunity B cell memory immune evasion pathogen virulence"
+        ),
+    },
+
+    {
+        "name": "Metabolism",
+        "tier": 2,
+        "description": (
+            "metabolism metabolic pathway energy homeostasis "
+            "glucose metabolism glycolysis gluconeogenesis glycogen "
+            "lipid metabolism fatty acid oxidation lipogenesis lipolysis "
+            "cholesterol bile acid triglyceride HDL LDL VLDL "
+            "amino acid metabolism protein catabolism urea cycle "
+            "mitochondria oxidative phosphorylation electron transport chain "
+            "TCA cycle citric acid Krebs cycle ATP production "
+            "insulin signaling insulin resistance type 2 diabetes "
+            "obesity adipose tissue adipogenesis adipokine leptin adiponectin "
+            "mTOR AMPK SIRT1 PPARgamma PGC-1alpha FoxO "
+            "liver metabolism hepatic gluconeogenesis NAFLD NASH "
+            "gut microbiome metabolite short chain fatty acid bile acid "
+            "cancer metabolism Warburg effect aerobic glycolysis glutamine "
+            "one-carbon metabolism serine folate methionine "
+            "nutrient sensing caloric restriction fasting ketogenesis "
+            "metabolomics mass spectrometry flux analysis isotope tracing"
+        ),
+    },
+
+    {
+        "name": "Epigenetics",
+        "tier": 2,
+        "description": (
+            "epigenetics epigenomics chromatin remodeling "
+            "DNA methylation CpG island methyltransferase DNMT TET "
+            "histone modification histone acetylation histone methylation "
+            "H3K4me3 H3K27me3 H3K9me3 H3K27ac H3K4me1 H3K36me3 "
+            "histone acetyltransferase HAT histone deacetylase HDAC "
+            "histone methyltransferase HMT histone demethylase "
+            "chromatin accessibility ATAC-seq DNase-seq "
+            "ChIP-seq CUT&RUN CUT&TAG chromatin immunoprecipitation "
+            "polycomb group trithorax group PRC1 PRC2 EZH2 "
+            "bromodomain BET BRD4 JMJD KDM "
+            "non-coding RNA lncRNA microRNA miRNA piRNA "
+            "X-inactivation genomic imprinting "
+            "3D genome topologically associating domain TAD loop "
+            "Hi-C cohesin CTCF enhancer promoter "
+            "epigenetic reprogramming cell fate pluripotency "
+            "cancer epigenetics epigenetic therapy HDAC inhibitor "
+            "single cell epigenomics scATAC-seq multiomics"
+        ),
+    },
+
+    {
+        "name": "Cardiovascular",
+        "tier": 2,
+        "description": (
+            "cardiovascular heart cardiac vascular endothelium "
+            "coronary artery disease myocardial infarction heart attack "
+            "heart failure cardiomyopathy atrial fibrillation arrhythmia "
+            "hypertension blood pressure atherosclerosis plaque "
+            "stroke cerebrovascular thrombosis clot coagulation "
+            "lipid cholesterol PCSK9 statin LDL HDL triglyceride "
+            "platelet aggregation anticoagulant antiplatelet "
+            "troponin BNP NT-proBNP cardiac biomarker "
+            "cardiac fibrosis remodeling ventricular hypertrophy "
+            "valve disease aortic stenosis mitral regurgitation "
+            "peripheral artery disease aortic aneurysm "
+            "cardiac metabolism energy substrate fatty acid glucose "
+            "cardiomyocyte contractility calcium handling "
+            "endothelial dysfunction nitric oxide eNOS "
+            "RAAS angiotensin ACE inhibitor ARB beta blocker "
+            "cardiac regeneration progenitor cell "
+            "single cell RNA-seq spatial transcriptomics heart"
+        ),
+    },
+
+    {
+        "name": "Cellular Organization & Processes",
+        "tier": 2,
+        "description": (
+            "cell biology cellular organization organelle "
+            "cell membrane cytoskeleton actin tubulin microtubule "
+            "nucleus nuclear pore lamina chromatin organization "
+            "endoplasmic reticulum ER stress unfolded protein response UPR "
+            "Golgi apparatus vesicle trafficking secretory pathway "
+            "lysosome autophagy mitophagy selective autophagy "
+            "mitochondria fission fusion dynamics biogenesis "
+            "proteasome ubiquitin proteasome system UPS "
+            "cell signaling pathway kinase phosphatase signal transduction "
+            "MAPK PI3K AKT mTOR Wnt Notch Hedgehog Hippo YAP TAZ "
+            "cell cycle G1 S G2 M phase CDK cyclin checkpoint "
+            "apoptosis caspase BCL2 BAX cytochrome c "
+            "necroptosis pyroptosis ferroptosis cell death "
+            "cell migration invasion actin dynamics focal adhesion "
+            "cell polarity tight junction adherens junction "
+            "extracellular matrix ECM collagen fibronectin integrin "
+            "mechanobiology mechanotransduction force sensing "
+            "phase separation liquid-liquid condensate biomolecular "
+            "protein quality control chaperone HSP70 HSP90 "
+            "super resolution microscopy live cell imaging CRISPR screen"
+        ),
+    },
+
+    {
+        "name": "Stem Cells",
+        "tier": 2,
+        "description": (
+            "stem cell pluripotent embryonic stem cell ESC "
+            "induced pluripotent stem cell iPSC reprogramming Yamanaka "
+            "Oct4 Sox2 Klf4 c-Myc pluripotency transcription factor "
+            "differentiation lineage commitment cell fate specification "
+            "hematopoietic stem cell HSC bone marrow transplant "
+            "mesenchymal stem cell MSC stromal cell "
+            "neural stem cell progenitor neurogenesis "
+            "intestinal stem cell Lgr5 organoid gut epithelium "
+            "cancer stem cell tumor initiating cell "
+            "self-renewal symmetric asymmetric division niche "
+            "Wnt Notch Hedgehog BMP FGF signaling stem cell "
+            "epigenetic regulation of stem cell H3K27me3 bivalent "
+            "single cell RNA sequencing scRNA-seq trajectory pseudotime "
+            "organoid 3D culture patient-derived organoid PDO "
+            "regenerative medicine cell therapy gene therapy "
+            "CRISPR base editing prime editing stem cell engineering "
+            "tissue engineering scaffold biomaterial "
+            "clonal dynamics lineage tracing barcode"
+        ),
+    },
+]
+
+# ── Academic / journal signals detected from SERP titles (no URLs needed)
+ACADEMIC_TITLE_SIGNALS = [
+    # Journals & publishers
+    "nature", "science", "cell", "lancet", "nejm", "new england journal",
+    "jama", "bmj", "plos", "pnas", "pubmed", "ncbi", "nih", "nci",
+    "frontiers", "wiley", "springer", "elsevier", "oxford", "cambridge",
+    "annals", "journal of", "american journal", "european journal",
+    "proceedings", "clinical cancer research", "cancer research",
+    # Institutional
+    "fda", "cdc", "who", "ema", "mayo clinic", "cleveland clinic",
+    "harvard", "stanford", "mit", "johns hopkins", "oxford university",
+    "cancer center", "medical center", "university hospital",
+    # Content signals
+    "systematic review", "meta-analysis", "randomized controlled",
+    "clinical trial", "case report", "cohort study", "phase 1", "phase 2", "phase 3",
+]
+
+FORMAT_SIGNALS = {
+    "listicle":  r"\b(top \d+|\d+ best|\d+ ways|\d+ tips|list of)\b",
+    "guide":     r"\b(guide|how to|tutorial|walkthrough|step.by.step)\b",
+    "overview":  r"\b(overview|introduction|what is|explained|understanding)\b",
+    "comparison":r"\b(vs\.?|versus|compare|comparison|difference between)\b",
+    "clinical":  r"\b(clinical|trial|study|results|efficacy|safety|phase [123])\b",
+    "news":      r"\b(new|latest|recent|update|breakthrough|announces?)\b",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 0. CLI
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Life Science Content Gap Analysis Pipeline")
+    p.add_argument("--keywords", required=True,
+                   help="CSV: keyword, [volume], [impressions], [clicks], [position]")
+    p.add_argument("--serp",     required=True,
+                   help="CSV: keyword, title_1..3, [paa_1..3], [snippet]")
+    p.add_argument("--output",   default="./output")
+    p.add_argument("--kw-col",   default="keyword",
+                   help="Keyword column name in keywords CSV (default: 'keyword')")
+    p.add_argument("--threshold", type=float, default=0.20,
+                   help="Min cosine sim to assign research area (default: 0.20)")
+    p.add_argument("--min-cluster", type=int, default=3,
+                   help="Min keywords per sub-topic cluster (default: 3)")
+    p.add_argument("--top-n",    type=int, default=20,
+                   help="Top N research areas in recommendations (default: 20)")
+    return p.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 1. LOAD & MERGE
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
+    print("\n[1/8] Loading and merging inputs...")
+
+    # ── Keywords
+    kw = pd.read_csv(kw_path)
+    if kw_col not in kw.columns:
+        raise ValueError(f"Column '{kw_col}' not found in keywords file. "
+                         f"Available: {list(kw.columns)}")
+    kw = kw.rename(columns={kw_col: "keyword"})
+    kw["keyword"] = kw["keyword"].str.strip().str.lower()
+    kw = kw.drop_duplicates("keyword").reset_index(drop=True)
+    print(f"    → {len(kw)} keywords loaded")
+
+    # ── SERP data
+    serp = pd.read_csv(serp_path)
+    serp.columns = [c.strip().lower().replace(" ", "_") for c in serp.columns]
+
+    # Normalise keyword column — try common names
+    for candidate in ("keyword", "query", "search_term", "term"):
+        if candidate in serp.columns:
+            serp = serp.rename(columns={candidate: "keyword"})
+            break
+    serp["keyword"] = serp["keyword"].str.strip().str.lower()
+    serp = serp.drop_duplicates("keyword").reset_index(drop=True)
+    print(f"    → {len(serp)} SERP rows loaded")
+
+    # ── Merge on keyword (left = keep all keywords)
+    df = kw.merge(serp, on="keyword", how="left")
+    print(f"    → {len(df)} rows after merge "
+          f"({df['title_1'].notna().sum() if 'title_1' in df.columns else 0} with SERP data)")
+
+    # ── Ensure expected GSC columns exist with sensible defaults
+    for col, default in [("impressions", 0), ("clicks", 0),
+                          ("position", 999), ("volume", 0)]:
+        if col not in df.columns:
+            df[col] = default
+        else:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2. ENRICH: keyword + SERP titles → embedding text
+# ═══════════════════════════════════════════════════════════════════════
+
+def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Concatenate keyword with up to 3 SERP result titles.
+    If SERP titles are missing, fall back to keyword alone.
+    The enriched text is what gets embedded — it bakes in Google's
+    interpretation of the keyword's informational context.
+    """
+    print("\n[2/8] Enriching keywords with SERP titles...")
+
+    title_cols = [c for c in df.columns if re.match(r"title_\d+", c)]
+
+    def build_text(row):
+        parts = [str(row["keyword"])]
+        for col in title_cols[:3]:
+            val = row.get(col, "")
+            if pd.notna(val) and str(val).strip():
+                parts.append(str(val).strip())
+        return " | ".join(parts)
+
+    df["enriched_text"] = df.apply(build_text, axis=1)
+
+    enriched = (df["enriched_text"].str.count(r"\|") > 0).sum()
+    print(f"    → {enriched}/{len(df)} keywords enriched with SERP titles")
+    print(f"    → {len(df)-enriched} keywords using bare keyword only")
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 3. EMBED
+# ═══════════════════════════════════════════════════════════════════════
+
+def embed_all(df: pd.DataFrame):
+    print("\n[3/8] Generating embeddings...")
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        raise ImportError("Run: pip install sentence-transformers")
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+
+    print("      Embedding enriched keyword texts...")
+    kw_emb = model.encode(
+        df["enriched_text"].tolist(),
+        show_progress_bar=True,
+        batch_size=64,
+        normalize_embeddings=True
+    )
+
+    print("      Embedding research area taxonomy...")
+    area_emb = model.encode(
+        [a["description"] for a in RESEARCH_AREAS],
+        show_progress_bar=False,
+        normalize_embeddings=True
+    )
+
+    print(f"    → Keyword embeddings: {kw_emb.shape} | Area embeddings: {area_emb.shape}")
+    return kw_emb, area_emb
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 4. RESEARCH AREA MAPPING
+# ═══════════════════════════════════════════════════════════════════════
+
+def map_research_areas(df: pd.DataFrame, kw_emb: np.ndarray,
+                        area_emb: np.ndarray, threshold: float) -> pd.DataFrame:
+    print(f"\n[4/8] Mapping to research areas (threshold={threshold})...")
+
+    sim        = kw_emb @ area_emb.T          # (n_kw, n_areas)
+    best_idx   = sim.argmax(axis=1)
+    best_score = sim.max(axis=1)
+
+    sim2       = sim.copy()
+    sim2[np.arange(len(sim2)), best_idx] = -1
+    second_idx = sim2.argmax(axis=1)
+
+    area_names = [a["name"] for a in RESEARCH_AREAS]
+
+    df["research_area"]       = [
+        area_names[i] if s >= threshold else "Unclassified / General Methods"
+        for i, s in zip(best_idx, best_score)
+    ]
+    df["research_area_score"] = best_score.round(4)
+    df["research_area_2"]     = [area_names[i] for i in second_idx]
+
+    classified = (df["research_area"] != "Unclassified / General Methods").sum()
+    print(f"    → {classified}/{len(df)} keywords classified")
+
+    print("\n    Research area keyword distribution:")
+    for area, cnt in df["research_area"].value_counts().items():
+        bar = "█" * min(35, max(1, cnt * 35 // len(df)))
+        print(f"      {cnt:>5}  {bar}  {area}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 5. SUB-TOPIC CLUSTERING
+# ═══════════════════════════════════════════════════════════════════════
+
+def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
+                     min_cluster: int) -> pd.DataFrame:
+    print("\n[5/8] Sub-topic clustering...")
+
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import AgglomerativeClustering, KMeans
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import normalize
+    from sklearn.metrics import pairwise_distances_argmin_min
+
+    n      = len(df)
+    n_comp = min(50, kw_emb.shape[1] - 1, n - 1)
+    reduced = normalize(TruncatedSVD(n_comp, random_state=42).fit_transform(kw_emb))
+
+    k = max(5, min(80, n // 8))
+    print(f"    → k={k} clusters for {n} keywords")
+
+    labels = (
+        AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average")
+        .fit_predict(reduced)
+        if n <= 5000 else
+        KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(reduced)
+    )
+
+    # Merge tiny clusters
+    counts    = pd.Series(labels).value_counts()
+    small     = counts[counts < min_cluster].index.tolist()
+    if small:
+        vm = ~np.isin(labels, small)
+        sm =  np.isin(labels, small)
+        if vm.sum() > 0 and sm.sum() > 0:
+            nearest, _ = pairwise_distances_argmin_min(
+                reduced[sm], reduced[vm], metric="cosine")
+            labels = labels.copy()
+            labels[sm] = labels[vm][nearest]
+        print(f"    → Merged {len(small)} tiny clusters")
+
+    # Label each cluster by centroid-closest keyword
+    label_map = {}
+    for cid in np.unique(labels):
+        mask     = labels == cid
+        embs     = reduced[mask]
+        centroid = embs.mean(axis=0)
+        closest  = df.loc[mask, "keyword"].iloc[(embs @ centroid).argmax()]
+        label_map[cid] = closest
+
+    df["cluster_id"]    = labels
+    df["cluster_label"] = [label_map[c] for c in labels]
+    print(f"    → {len(label_map)} sub-topic clusters produced")
+
+    # t-SNE for visualization
+    print("    → Running t-SNE...")
+    perp = min(30, max(5, n // 10))
+    from sklearn.manifold import TSNE
+    xy = TSNE(2, perplexity=perp, learning_rate="auto",
+              init="pca", random_state=42).fit_transform(reduced)
+    df["tsne_x"] = xy[:, 0]
+    df["tsne_y"] = xy[:, 1]
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 6. COMPETITOR LANDSCAPE
+# ═══════════════════════════════════════════════════════════════════════
+
+def analyze_competitor_landscape(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Infer competitor landscape from SERP titles alone — no URLs needed.
+
+    Per keyword computes:
+      academic_lock    : 0-1 — how many of the 3 titles signal journal/institutional content
+                         High = PubMed/Nature/clinical trial dominated = hard to displace
+      dominant_format  : content format the SERP rewards (guide/overview/clinical/news/other)
+      serp_diversity   : are titles semantically varied (good) or all saying the same thing?
+                         Proxy: count distinct first words across titles
+
+    Why titles are better than URLs here:
+      - "Nature Communications | EZH2 inhibition in cancer" tells you more than a URL ever would
+      - Titles are clean, always present, and directly reflect what Google is rewarding
+      - Academic lock-in is highly visible in titles: journal name, study type, institution
+    """
+    print("\n[6/8] Analyzing competitor landscape from SERP titles...")
+
+    title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
+
+    academic_lock_list   = []
+    dominant_format_list = []
+    serp_diversity_list  = []
+
+    for _, row in df.iterrows():
+        titles = [
+            str(row.get(col, "")).strip().lower()
+            for col in title_cols[:3]
+            if pd.notna(row.get(col)) and str(row.get(col, "")).strip()
+        ]
+
+        if not titles:
+            academic_lock_list.append(0.5)    # unknown — neutral
+            dominant_format_list.append("unknown")
+            serp_diversity_list.append(0.5)
+            continue
+
+        all_titles_text = " ".join(titles)
+
+        # ── Academic lock-in: count how many titles contain academic signals
+        acad_hits = sum(
+            1 for title in titles
+            if any(sig in title for sig in ACADEMIC_TITLE_SIGNALS)
+        )
+        academic_lock_list.append(round(acad_hits / len(titles), 2))
+
+        # ── Dominant format from title language
+        fmt_hits = {
+            fmt: bool(re.search(pat, all_titles_text))
+            for fmt, pat in FORMAT_SIGNALS.items()
+        }
+        # clinical takes priority for life science (most distinctive)
+        dominant = "other"
+        for fmt in ("clinical", "guide", "overview", "listicle", "comparison", "news"):
+            if fmt_hits.get(fmt):
+                dominant = fmt
+                break
+        dominant_format_list.append(dominant)
+
+        # ── SERP diversity: distinct first words = titles covering different angles
+        first_words = {t.split()[0] for t in titles if t}
+        serp_diversity_list.append(round(len(first_words) / max(len(titles), 1), 2))
+
+    df["academic_lock"]   = academic_lock_list
+    df["dominant_format"] = dominant_format_list
+    df["serp_diversity"]  = serp_diversity_list
+
+    avg_lock = df["academic_lock"].mean()
+    pct_clinical = (df["dominant_format"] == "clinical").mean() * 100
+    print(f"    → Avg academic lock-in:  {avg_lock:.2f}  (0=open, 1=journal dominated)")
+    print(f"    → Clinical format SERPs: {pct_clinical:.1f}%")
+    print(f"    → Format breakdown:")
+    for fmt, cnt in df["dominant_format"].value_counts().items():
+        print(f"         {fmt:<15} {cnt:>5}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 7. GAP ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Four gap types scored at keyword level (URLs and dates removed):
+
+    ABSENCE GAP     — impressions == 0 → no content presence at all
+    PERFORMANCE GAP — impressions > 0 but position > 10 OR CTR < 2%
+    FORMAT GAP      — SERP rewards accessible content (guide/overview)
+                      but academic lock is low and you're not ranking
+                      → opportunity to win with well-structured content
+    PAA GAP         — PAA questions exist for this keyword but you're
+                      not in top 10 → specific content angle opportunity
+    SNIPPET GAP     — featured snippet exists but you don't own it
+
+    Composite gap_score = weighted sum (0-1).
+    """
+    print("\n[7/8] Running gap analysis...")
+
+    paa_cols = sorted([c for c in df.columns if re.match(r"paa_\d+", c)])
+
+    # ── CTR
+    df["ctr"] = np.where(
+        df["impressions"] > 0,
+        (df["clicks"] / df["impressions"]).round(4),
+        0.0
+    )
+
+    # ── Absence gap: zero GSC impressions
+    df["gap_absence"] = df["impressions"] == 0
+
+    # ── Performance gap: visible but underperforming
+    df["gap_performance"] = (
+        (df["impressions"] > 0) &
+        ((df["position"] > 10) | (df["ctr"] < 0.02))
+    )
+
+    # ── Format gap: SERP rewards accessible formats (guide/overview)
+    #    AND academic lock is low (meaning format actually matters here)
+    #    AND you're not ranking — so a well-structured article could win
+    df["gap_format"] = (
+        (df["dominant_format"].isin(["guide", "overview", "listicle"])) &
+        (df["academic_lock"] < 0.4) &
+        (df["position"] > 10)
+    )
+
+    # ── PAA gap: questions exist for this keyword, you're not in top 10
+    has_paa = pd.Series(False, index=df.index)
+    for col in paa_cols[:3]:
+        has_paa = has_paa | (
+            df[col].notna() & (df[col].astype(str).str.strip() != "")
+        )
+
+    df["paa_questions"] = (
+        df[paa_cols].apply(
+            lambda row: " | ".join(
+                str(v) for v in row if pd.notna(v) and str(v).strip()
+            ), axis=1
+        ) if paa_cols else pd.Series("", index=df.index)
+    )
+
+    df["gap_paa"] = has_paa & (df["position"] > 10)
+
+    # ── Snippet gap: snippet exists but you don't own it
+    if "snippet" in df.columns:
+        df["gap_snippet"] = (
+            df["snippet"].notna() &
+            (df["snippet"].astype(str).str.strip() != "") &
+            (df["position"] > 5)
+        )
+    else:
+        df["gap_snippet"] = False
+
+    # ── Composite gap score
+    weights = {
+        "gap_absence":     0.40,   # highest — no presence = biggest gap
+        "gap_performance": 0.30,   # second — visible but losing
+        "gap_paa":         0.15,   # question angle opportunity
+        "gap_format":      0.10,   # content type opportunity
+        "gap_snippet":     0.05,   # featured snippet opportunity
+    }
+    df["gap_score"] = sum(
+        df[col].astype(float) * w for col, w in weights.items()
+    ).round(3)
+
+    # ── Primary gap label for quick reading
+    def primary_gap(row):
+        if row["gap_absence"]:     return "Absence"
+        if row["gap_performance"]: return "Performance"
+        if row["gap_paa"]:         return "PAA"
+        if row["gap_format"]:      return "Format"
+        if row["gap_snippet"]:     return "Snippet"
+        return "None"
+
+    df["primary_gap"] = df.apply(primary_gap, axis=1)
+
+    # ── Summary
+    gap_counts = {
+        "Absence":     int(df["gap_absence"].sum()),
+        "Performance": int(df["gap_performance"].sum()),
+        "PAA":         int(df["gap_paa"].sum()),
+        "Format":      int(df["gap_format"].sum()),
+        "Snippet":     int(df["gap_snippet"].sum()),
+    }
+    print("\n    Gap type breakdown:")
+    for gtype, cnt in gap_counts.items():
+        pct = cnt / len(df) * 100
+        bar = "█" * min(30, int(pct / 2))
+        print(f"      {gtype:<15} {cnt:>5}  ({pct:5.1f}%)  {bar}")
+
+    return df
+
+    df["paa_questions"] = df[paa_cols].apply(
+        lambda row: " | ".join(
+            str(v) for v in row if pd.notna(v) and str(v).strip()
+        ), axis=1
+    ) if paa_cols else ""
+
+    df["gap_paa"] = has_paa & (df["position"] > 10)
+
+    # ── Snippet gap: featured snippet exists but we don't own it
+    if "snippet" in df.columns:
+        df["gap_snippet"] = (
+            df["snippet"].notna() &
+            (df["snippet"].astype(str).str.strip() != "") &
+            (df["position"] > 5)
+        )
+    else:
+        df["gap_snippet"] = False
+
+    # ── Composite gap score (weighted)
+    # Absence weighted highest — no presence at all is the biggest gap
+    weights = {
+        "gap_absence":     0.40,
+        "gap_performance": 0.30,
+        "gap_format":      0.15,
+        "gap_paa":         0.10,
+        "gap_snippet":     0.05,
+    }
+    df["gap_score"] = sum(
+        df[col].astype(float) * w for col, w in weights.items()
+    ).round(3)
+
+    # ── Gap type label (primary gap for quick reading)
+    def primary_gap(row):
+        if row["gap_absence"]:     return "Absence"
+        if row["gap_performance"]: return "Performance"
+        if row["gap_format"]:      return "Format"
+        if row["gap_paa"]:         return "PAA"
+        if row["gap_snippet"]:     return "Snippet"
+        return "None"
+
+    df["primary_gap"] = df.apply(primary_gap, axis=1)
+
+    # ── Summary stats
+    gap_counts = {
+        "Absence":     df["gap_absence"].sum(),
+        "Performance": df["gap_performance"].sum(),
+        "Format":      df["gap_format"].sum(),
+        "PAA":         df["gap_paa"].sum(),
+        "Snippet":     df["gap_snippet"].sum(),
+    }
+    print("\n    Gap type breakdown:")
+    for gtype, cnt in gap_counts.items():
+        pct = cnt / len(df) * 100
+        bar = "█" * min(30, int(pct / 2))
+        print(f"      {gtype:<15} {cnt:>5}  ({pct:5.1f}%)  {bar}")
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 8. OPPORTUNITY SCORING & RECOMMENDATIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
+    """
+    Roll up to research area level.
+
+    Opportunity = demand × gap × winnability
+
+      demand      = keyword count (or total volume if available)
+      gap         = avg gap_score across keywords in area
+      winnability = (1 - avg academic_lock) × avg serp_diversity
+                    — low academic lock + high SERP diversity = easier to compete
+
+    Separate absence_gap% and performance_gap% drive recommended action:
+      if absence_gap% > 60%     → "Create"
+      if performance_gap% > 40% → "Optimise"
+      else                      → "Create & Optimise"
+    """
+    print("\n[8/8] Scoring and ranking research areas...")
+
+    work = df[df["research_area"] != "Unclassified / General Methods"].copy()
+
+    # Volume proxy: use search volume if available, else impressions, else count
+    if "volume" in work.columns and work["volume"].sum() > 0:
+        vol_col = "volume"
+    elif work["impressions"].sum() > 0:
+        vol_col = "impressions"
+    else:
+        vol_col = None
+
+    agg_dict = dict(
+        keyword_count        = ("keyword",            "count"),
+        avg_similarity       = ("research_area_score","mean"),
+        avg_gap_score        = ("gap_score",          "mean"),
+        avg_academic_lock    = ("academic_lock",      "mean"),
+        avg_serp_diversity   = ("serp_diversity",     "mean"),
+        absence_gap_count    = ("gap_absence",        "sum"),
+        performance_gap_count= ("gap_performance",   "sum"),
+        format_gap_count     = ("gap_format",         "sum"),
+        paa_gap_count        = ("gap_paa",            "sum"),
+        snippet_gap_count    = ("gap_snippet",        "sum"),
+        sample_keywords      = ("keyword",            lambda x: " | ".join(list(x)[:8])),
+        sub_topics           = ("cluster_label",      lambda x: " · ".join(
+                                 x.value_counts().head(5).index.tolist())),
+    )
+
+    if vol_col:
+        agg_dict["total_volume"] = (vol_col, "sum")
+
+    area_df = work.groupby("research_area").agg(**agg_dict).reset_index()
+
+
+    # ── Normalise demand
+    if vol_col:
+        area_df["demand_score"] = area_df["total_volume"] / area_df["total_volume"].max()
+    else:
+        area_df["demand_score"] = area_df["keyword_count"] / area_df["keyword_count"].max()
+
+    # ── Winnability: low academic lock + high SERP diversity = accessible
+    area_df["winnability"] = (
+        (1 - area_df["avg_academic_lock"]) * area_df["avg_serp_diversity"]
+    ).clip(0, 1).round(3)
+
+    # ── Opportunity score
+    area_df["opportunity_score"] = (
+        area_df["demand_score"]  * 0.45 +
+        area_df["avg_gap_score"] * 0.35 +
+        area_df["winnability"]   * 0.20
+    ).round(3)
+
+    # ── Gap percentages
+    area_df["absence_gap_pct"]    = (
+        area_df["absence_gap_count"]    / area_df["keyword_count"] * 100).round(1)
+    area_df["performance_gap_pct"]= (
+        area_df["performance_gap_count"]/ area_df["keyword_count"] * 100).round(1)
+
+    # ── Recommended action
+    def action(row):
+        if row["absence_gap_pct"] >= 60:
+            return "🆕 Create"
+        if row["performance_gap_pct"] >= 40:
+            return "🔧 Optimise"
+        return "🆕+🔧 Create & Optimise"
+
+    area_df["recommended_action"] = area_df.apply(action, axis=1)
+
+    # ── Priority tier
+    def tier(s):
+        if s >= 0.55: return "🔴 High"
+        if s >= 0.30: return "🟡 Medium"
+        return                "🟢 Monitor"
+
+    area_df["priority"] = area_df["opportunity_score"].apply(tier)
+
+    # ── Add tier from taxonomy
+    tier_lookup = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
+    area_df["tier"] = area_df["research_area"].map(tier_lookup).fillna(2).astype(int)
+    area_df["tier_label"] = area_df["tier"].map({1: "⭐ Tier 1", 2: "Tier 2"})
+
+    # Sort: Tier 1 areas first, then by opportunity score within each tier
+    recs = (
+        area_df
+        .sort_values(["tier", "opportunity_score"], ascending=[True, False])
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    recs.index += 1
+    recs.index.name = "rank"
+
+    print(f"    → {len(area_df)} research areas scored")
+    return area_df, recs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9. HTML REPORT
+# ═══════════════════════════════════════════════════════════════════════
+
+def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
+    print("\n    → Generating HTML report...")
+
+    # ── Scatter coloured by research area
+    try:
+        import plotly.express as px
+        import plotly.io as pio
+
+        hover = ["keyword", "research_area", "primary_gap",
+                 "gap_score", "position", "cluster_label"]
+        hover = [c for c in hover if c in df.columns]
+
+        fig = px.scatter(
+            df, x="tsne_x", y="tsne_y",
+            color="research_area",
+            symbol="primary_gap",
+            hover_data=hover,
+            title="Keyword Map — Research Areas & Gap Types",
+            labels={"tsne_x": "t-SNE 1", "tsne_y": "t-SNE 2",
+                    "research_area": "Research Area",
+                    "primary_gap":   "Primary Gap"},
+            height=800, template="plotly_white"
+        )
+        fig.update_traces(marker=dict(size=6, opacity=0.75))
+        scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
+
+        # Gap breakdown bar chart
+        gap_data = pd.DataFrame({
+            "Gap Type": ["Absence", "Performance", "Format", "PAA", "Snippet"],
+            "Count":    [
+                int(df["gap_absence"].sum()),
+                int(df["gap_performance"].sum()),
+                int(df["gap_format"].sum()),
+                int(df["gap_paa"].sum()),
+                int(df["gap_snippet"].sum()),
+            ]
+        })
+        fig2 = px.bar(
+            gap_data, x="Gap Type", y="Count",
+            title="Gap Type Distribution Across All Keywords",
+            color="Gap Type", template="plotly_white", height=350
+        )
+        bar_html = pio.to_html(fig2, full_html=False, include_plotlyjs=False)
+
+    except ImportError:
+        scatter_html = "<p><em>pip install plotly for charts</em></p>"
+        bar_html     = ""
+
+    # ── Recommendations table
+    col_order = [
+        "research_area", "keyword_count", "absence_gap_pct",
+        "performance_gap_pct", "winnability", "opportunity_score",
+        "priority", "recommended_action", "top_competitors", "sub_topics"
+    ]
+    col_order = [c for c in col_order if c in recs.columns]
+
+    rec_rows = ""
+    for rank, row in recs.iterrows():
+        rec_rows += f"""
+        <tr>
+          <td style='text-align:center;font-weight:700'>{rank}</td>
+          <td>{row.get('tier_label','')}</td>
+          <td><strong>{row['research_area']}</strong></td>
+          <td style='text-align:center'>{row.get('keyword_count','')}</td>
+          <td style='text-align:center'>{row.get('absence_gap_pct','')}%</td>
+          <td style='text-align:center'>{row.get('performance_gap_pct','')}%</td>
+          <td style='text-align:center'>{row.get('avg_academic_lock','')}</td>
+          <td style='text-align:center'>{row.get('winnability','')}</td>
+          <td style='text-align:center'>{row.get('opportunity_score','')}</td>
+          <td>{row.get('priority','')}</td>
+          <td>{row.get('recommended_action','')}</td>
+          <td style='font-size:0.8em;color:#444'>{row.get('sub_topics','')}</td>
+        </tr>"""
+
+    # ── Summary stats
+    n_kw      = len(df)
+    n_areas   = (df["research_area"] != "Unclassified / General Methods").nunique() - 1
+    n_absence = int(df["gap_absence"].sum())
+    n_perf    = int(df["gap_performance"].sum())
+    n_unclass = int((df["research_area"] == "Unclassified / General Methods").sum())
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Life Science Content Gap Analysis</title>
+  <style>
+    body   {{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+            margin:0;padding:24px 44px;background:#f0f4f8;color:#212529;}}
+    h1     {{color:#0d1b2a;border-bottom:3px solid #0077b6;padding-bottom:10px;}}
+    h2     {{color:#0077b6;margin-top:36px;}}
+    .stats {{display:flex;gap:16px;flex-wrap:wrap;margin:20px 0;}}
+    .card  {{background:white;border-radius:10px;padding:14px 22px;
+            box-shadow:0 2px 8px rgba(0,0,0,.08);min-width:130px;}}
+    .card .num {{font-size:1.9em;font-weight:700;color:#0077b6;}}
+    .card .lbl {{font-size:0.82em;color:#6c757d;margin-top:3px;}}
+    table  {{width:100%;border-collapse:collapse;background:white;
+            border-radius:10px;overflow:hidden;
+            box-shadow:0 2px 8px rgba(0,0,0,.08);font-size:0.86em;}}
+    th     {{background:#0077b6;color:white;padding:10px 8px;text-align:left;}}
+    td     {{padding:9px 8px;border-bottom:1px solid #e9ecef;}}
+    tr:hover td {{background:#e8f4fd;}}
+    .plot  {{background:white;border-radius:10px;padding:16px;
+            box-shadow:0 2px 8px rgba(0,0,0,.08);margin:16px 0;}}
+    .note  {{background:#d1ecf1;border-left:4px solid #0077b6;
+            padding:12px 16px;border-radius:4px;margin:16px 0;font-size:0.88em;}}
+    .legend {{display:flex;gap:24px;flex-wrap:wrap;margin:12px 0;font-size:0.85em;}}
+    .leg-item {{display:flex;align-items:center;gap:6px;}}
+  </style>
+</head>
+<body>
+  <h1>🔬 Life Science Content Gap Analysis</h1>
+
+  <div class="stats">
+    <div class="card"><div class="num">{n_kw}</div><div class="lbl">Total Keywords</div></div>
+    <div class="card"><div class="num">{n_areas}</div><div class="lbl">Research Areas</div></div>
+    <div class="card"><div class="num">{n_absence}</div><div class="lbl">Absence Gaps</div></div>
+    <div class="card"><div class="num">{n_perf}</div><div class="lbl">Performance Gaps</div></div>
+    <div class="card"><div class="num">{n_unclass}</div><div class="lbl">Unclassified</div></div>
+  </div>
+
+  <div class="note">
+    <strong>How to read this:</strong>
+    <strong>Absence gap</strong> = zero GSC impressions (no content exists or indexed).
+    <strong>Performance gap</strong> = impressions exist but position &gt;10 or CTR &lt;2%.
+    <strong>Winnability</strong> = domain diversity × (1 − academic lock-in) — higher means easier to compete.
+    <strong>Opportunity Score</strong> = 45% demand + 35% gap score + 20% winnability.
+  </div>
+
+  <h2>📊 Keyword Map</h2>
+  <div class="plot">{scatter_html}</div>
+
+  <h2>📉 Gap Distribution</h2>
+  <div class="plot">{bar_html}</div>
+
+  <h2>🎯 Research Area Recommendations</h2>
+  <table>
+    <thead><tr>
+      <th>#</th><th>Tier</th><th>Research Area</th><th>Keywords</th>
+      <th>Absence Gap%</th><th>Perf Gap%</th>
+      <th>Academic Lock</th><th>Winnability</th><th>Opp Score</th>
+      <th>Priority</th><th>Action</th><th>Key Sub-topics</th>
+    </tr></thead>
+    <tbody>{rec_rows}</tbody>
+  </table>
+
+  <p style="margin-top:40px;color:#aaa;font-size:0.78em">
+    Model: all-MiniLM-L6-v2 &nbsp;|&nbsp;
+    {len(RESEARCH_AREAS)} research areas (Tier 1: Neuroscience · Oncology · Immunology) &nbsp;|&nbsp;
+    Agglomerative clustering + t-SNE &nbsp;|&nbsp;
+    Gap types: Absence · Performance · Freshness · Format · PAA · Snippet
+  </p>
+</body>
+</html>"""
+
+    path = os.path.join(output_dir, "report.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"    → report.html saved")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
+
+    # ── Stage 1: Load & merge
+    df = load_and_merge(args.keywords, args.serp, args.kw_col)
+
+    # ── Stage 2: Enrich text
+    df = enrich_text(df)
+
+    # ── Stage 3: Embed
+    kw_emb, area_emb = embed_all(df)
+
+    # ── Stage 4: Research area mapping
+    df = map_research_areas(df, kw_emb, area_emb, args.threshold)
+
+    # ── Stage 5: Sub-topic clustering
+    df = cluster_keywords(df, kw_emb, args.min_cluster)
+
+    # ── Stage 6: Competitor landscape
+    df = analyze_competitor_landscape(df)
+
+    # ── Stage 7: Gap analysis
+    df = analyze_gaps(df)
+
+    # ── Stage 8: Score & recommend
+    area_df, recs = score_and_recommend(df, args.top_n)
+
+    # ── Stage 9: Save outputs
+    drop_cols   = ["tsne_x", "tsne_y", "enriched_text"]
+    clusters_path = os.path.join(args.output, "clusters.csv")
+    gaps_path     = os.path.join(args.output, "gaps.csv")
+    recs_path     = os.path.join(args.output, "recommendations.csv")
+
+    df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
+
+    gap_cols = ["keyword", "research_area", "cluster_label", "primary_gap",
+                "gap_score", "gap_absence", "gap_performance",
+                "gap_format", "gap_paa", "gap_snippet", "paa_questions",
+                "impressions", "clicks", "position", "ctr",
+                "academic_lock", "dominant_format", "serp_diversity"]
+    gap_cols = [c for c in gap_cols if c in df.columns]
+    (
+        df[df["primary_gap"] != "None"][gap_cols]
+        .sort_values("gap_score", ascending=False)
+        .to_csv(gaps_path, index=False)
+    )
+
+    recs.to_csv(recs_path)
+    generate_report(df, recs, args.output)
+
+    print("\n" + "═" * 62)
+    print("✅  Pipeline complete!")
+    print(f"   clusters.csv        → {clusters_path}")
+    print(f"   gaps.csv            → {gaps_path}")
+    print(f"   recommendations.csv → {recs_path}")
+    print(f"   report.html         → {os.path.join(args.output, 'report.html')}")
+    print("═" * 62)
+
+    print("\n📋  Top Research Area Recommendations:\n")
+    show_cols = ["research_area", "keyword_count", "absence_gap_pct",
+                 "performance_gap_pct", "opportunity_score",
+                 "priority", "recommended_action"]
+    show_cols = [c for c in show_cols if c in recs.columns]
+    print(recs[show_cols].to_string())
+
+
+if __name__ == "__main__":
+    main()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EXPECTED INPUT FORMATS
+# ═══════════════════════════════════════════════════════════════════════
+#
+# keywords.csv
+# ────────────
+# Required:  keyword, impressions, clicks, position
+# Optional:  volume  (SEMrush/GSC search volume — improves demand scoring)
+#
+#   keyword,impressions,clicks,position
+#   CAR-T cell therapy,3100,280,4.1
+#   PD-1 checkpoint,1800,95,14.7
+#
+#
+# serp_data.csv
+# ─────────────
+# Required:  keyword, title_1, title_2, title_3
+# Optional:  paa_1, paa_2, paa_3   (People Also Ask questions)
+#            snippet                (Featured snippet text)
+#
+# NOTE: URLs and dates are NOT needed and should be excluded.
+#       Titles carry all the signal needed for academic lock-in
+#       detection, format classification, and enriched embedding.
+#
+#   keyword,title_1,title_2,title_3,paa_1,paa_2,snippet
+#   CAR-T cell therapy,CAR-T Cell Therapy Overview | NCI,How CAR-T Works,CAR-T Side Effects,What cancers does CAR-T treat?,How long does CAR-T last?,CAR-T therapy uses a patient's own T cells to fight cancer.
+#
+#
+# Run:
+#   python lifesci_gap_pipeline.py \
+#     --keywords keywords.csv \
+#     --serp     serp_data.csv \
+#     --output   ./results
+#
+# Optional flags:
+#   --threshold 0.20    min cosine similarity to assign a research area
+#   --min-cluster 3     min keywords per sub-topic cluster
+#   --top-n 9           show all 9 research areas in recommendations
+#   --kw-col query      if your keyword column has a different name
+# ═══════════════════════════════════════════════════════════════════════
