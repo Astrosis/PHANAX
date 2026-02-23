@@ -242,61 +242,6 @@ def label_clusters(df: pd.DataFrame, embeddings: np.ndarray) -> pd.DataFrame:
 # 5. MeSH MAPPING via NCBI E-utilities (FREE)
 # ─────────────────────────────────────────────
 
-MESH_CACHE = {}
-
-def query_mesh(term: str) -> dict:
-    """
-    Query NCBI MeSH via the free E-utilities API.
-    Returns the best matching MeSH descriptor and its tree numbers (hierarchy path).
-    Rate limited to ~3 req/sec to stay within NCBI's free tier.
-    """
-    if term in MESH_CACHE:
-        return MESH_CACHE[term]
-
-    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-    result = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
-
-    try:
-        # Step 1: Search for matching MeSH UIDs
-        search_url = (
-            f"{base}esearch.fcgi?db=mesh&term={requests.utils.quote(term)}"
-            f"&retmax=1&retmode=json"
-        )
-        r = requests.get(search_url, timeout=10)
-        data = r.json()
-        ids = data.get("esearchresult", {}).get("idlist", [])
-
-        if not ids:
-            MESH_CACHE[term] = result
-            return result
-
-        # Step 2: Fetch descriptor details
-        fetch_url = (
-            f"{base}esummary.fcgi?db=mesh&id={ids[0]}&retmode=json"
-        )
-        r2 = requests.get(fetch_url, timeout=10)
-        summary = r2.json().get("result", {}).get(ids[0], {})
-
-        ds_meshterms = summary.get("ds_meshterms", [])
-        ds_idxlinks  = summary.get("ds_idxlinks", "")
-
-        if ds_meshterms:
-            result["mesh_term"] = ds_meshterms[0] if ds_meshterms else None
-
-        # Tree numbers encode the MeSH hierarchy (e.g., C04 = Neoplasms)
-        tree_nums = summary.get("ds_treenums", [])
-        if tree_nums:
-            result["mesh_tree"] = tree_nums[0]
-            result["mesh_category"] = _tree_to_category(tree_nums[0])
-
-    except Exception:
-        pass  # Silently skip on network errors; MeSH enrichment is optional
-
-    MESH_CACHE[term] = result
-    time.sleep(0.34)  # ~3 req/sec limit
-    return result
-
-
 # Top-level MeSH tree categories relevant to life sciences
 MESH_TREE_MAP = {
     "A": "Anatomy",
@@ -332,38 +277,232 @@ DISEASE_SUBTREES = {
     "C15": "Hemic / Lymphatic Diseases",
     "C16": "Congenital / Hereditary Diseases",
     "C17": "Skin Diseases",
+    "C07": "Stomatognathic Diseases",
+    "C09": "Otorhinolaryngologic Diseases",
+    "C11": "Eye Diseases",
+    "C19": "Endocrine System Diseases",
+    "C21": "Disorders of Environmental Origin",
+    "C22": "Animal Diseases",
+    "C26": "Wounds and Injuries",
+    "G01": "Biological Sciences (General)",
+    "G02": "Chemical Phenomena",
+    "G03": "Metabolism",
+    "G04": "Cell Physiological Phenomena",
+    "G05": "Genetic Phenomena",
+    "G06": "Microbiological Phenomena",
+    "G07": "Physiological Phenomena",
+    "G16": "Biological Phenomena",
 }
 
+# Generic MeSH terms that are too broad to be useful — we skip these
+# and try the next candidate keyword from the cluster instead
+GENERIC_MESH_TERMS = {
+    "analysis", "methods", "technique", "techniques", "procedure", "procedures",
+    "study", "studies", "research", "test", "tests", "testing", "assay", "assays",
+    "measurement", "evaluation", "assessment", "review", "overview", "introduction",
+    "general", "other", "miscellaneous", "various", "multiple", "combined",
+    "biological", "clinical", "medical", "scientific", "laboratory",
+}
+
+MESH_CACHE = {}
+NCBI_BASE  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+
 def _tree_to_category(tree: str) -> str:
+    """Map a MeSH tree number to a human-readable category."""
+    if not tree:
+        return None
     prefix3 = tree[:3]
     prefix1 = tree[:1]
     return DISEASE_SUBTREES.get(prefix3,
-           MESH_TREE_MAP.get(prefix1, "Other Life Science"))
+           MESH_TREE_MAP.get(prefix1, None))
+
+
+def _fetch_mesh_descriptor(uid: str) -> dict:
+    """
+    Fetch full MeSH descriptor for a single UID via efetch (XML).
+    Returns preferred term, scope note, and all tree numbers.
+    This is more reliable than esummary for getting tree numbers.
+    """
+    result = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
+    try:
+        fetch_url = (
+            f"{NCBI_BASE}efetch.fcgi?db=mesh&id={uid}&retmode=json&rettype=full"
+        )
+        r = requests.get(fetch_url, timeout=10)
+        # efetch for MeSH returns XML-like text; fall back to esummary for JSON
+        sum_url = f"{NCBI_BASE}esummary.fcgi?db=mesh&id={uid}&retmode=json"
+        r2      = requests.get(sum_url, timeout=10)
+        summary = r2.json().get("result", {}).get(uid, {})
+
+        # ── Preferred term: use ds_name (the actual descriptor name) not ds_meshterms
+        #    ds_name is the canonical MeSH heading; ds_meshterms are entry terms/synonyms
+        name = summary.get("ds_name", "")
+        if name:
+            result["mesh_term"] = name
+
+        # ── Tree numbers: try multiple field names NCBI uses inconsistently
+        tree_nums = (
+            summary.get("ds_treenums")        # list
+            or summary.get("ds_treenum")       # sometimes singular
+            or []
+        )
+        # Sometimes comes back as a comma-delimited string
+        if isinstance(tree_nums, str):
+            tree_nums = [t.strip() for t in tree_nums.split(",") if t.strip()]
+
+        if tree_nums:
+            # Pick the most specific tree number (longest prefix = most specific)
+            tree_nums_sorted = sorted(tree_nums, key=len, reverse=True)
+            result["mesh_tree"] = tree_nums_sorted[0]
+            # Try each tree num for category; pick first non-None
+            for t in tree_nums_sorted:
+                cat = _tree_to_category(t)
+                if cat:
+                    result["mesh_category"] = cat
+                    break
+
+        # ── Fallback: derive category from ds_idxlinks if still no category
+        if not result["mesh_category"] and result["mesh_term"]:
+            # Use the first letter of the tree numbers available in idxlinks
+            idxlinks = summary.get("ds_idxlinks", "")
+            for char in idxlinks:
+                if char.isalpha() and char.isupper():
+                    cat = MESH_TREE_MAP.get(char)
+                    if cat:
+                        result["mesh_category"] = cat
+                        break
+
+    except Exception:
+        pass
+    return result
+
+
+def _query_mesh_single(term: str) -> dict:
+    """
+    Search MeSH for a single term. Returns descriptor dict or empty result.
+    Skips results where the matched descriptor name is a generic/useless term.
+    """
+    empty = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
+    try:
+        search_url = (
+            f"{NCBI_BASE}esearch.fcgi?db=mesh"
+            f"&term={requests.utils.quote(term + '[MeSH Terms]')}"
+            f"&retmax=3&retmode=json"
+        )
+        r    = requests.get(search_url, timeout=10)
+        ids  = r.json().get("esearchresult", {}).get("idlist", [])
+
+        if not ids:
+            # Retry without field tag for broader match
+            search_url2 = (
+                f"{NCBI_BASE}esearch.fcgi?db=mesh"
+                f"&term={requests.utils.quote(term)}"
+                f"&retmax=3&retmode=json"
+            )
+            r   = requests.get(search_url2, timeout=10)
+            ids = r.json().get("esearchresult", {}).get("idlist", [])
+
+        if not ids:
+            return empty
+
+        # Try each returned UID; skip if the matched term is too generic
+        for uid in ids:
+            desc = _fetch_mesh_descriptor(uid)
+            matched = (desc.get("mesh_term") or "").lower()
+            if matched and matched not in GENERIC_MESH_TERMS:
+                return desc
+
+        return empty
+
+    except Exception:
+        return empty
+
+
+def query_mesh_for_cluster(cluster_keywords: list) -> dict:
+    """
+    Query MeSH using multiple keywords from the cluster, not just the centroid.
+
+    Strategy:
+      1. Try the centroid keyword first (most representative)
+      2. If result is generic/empty, try the next most frequent keywords
+      3. Accept the first result that returns a specific, non-generic MeSH term
+      4. Fall back to category-only if a tree letter can be inferred
+
+    This fixes both issues:
+      - Generic centroid keywords (e.g. "assay") no longer poison the result
+      - More cluster keywords = more chances to find a valid MeSH mapping
+    """
+    cache_key = cluster_keywords[0] if cluster_keywords else ""
+    if cache_key in MESH_CACHE:
+        return MESH_CACHE[cache_key]
+
+    empty = {"mesh_term": None, "mesh_tree": None, "mesh_category": None}
+
+    # Try each keyword in order; stop at first good result
+    candidates = cluster_keywords[:6]  # try up to 6 keywords per cluster
+    best = empty
+
+    for kw in candidates:
+        kw_clean = kw.strip().lower()
+        if not kw_clean or kw_clean in GENERIC_MESH_TERMS:
+            continue
+
+        result = _query_mesh_single(kw_clean)
+        time.sleep(0.34)  # ~3 req/sec NCBI rate limit
+
+        if result["mesh_term"] and result["mesh_term"].lower() not in GENERIC_MESH_TERMS:
+            if result["mesh_category"]:
+                # Full hit — term + category. Best possible result, stop here.
+                MESH_CACHE[cache_key] = result
+                return result
+            elif result["mesh_term"]:
+                # Partial hit — term without category. Keep looking but store as fallback.
+                if not best["mesh_term"]:
+                    best = result
+
+    # Return best partial result found, or empty
+    MESH_CACHE[cache_key] = best
+    return best
 
 
 def map_clusters_to_mesh(df: pd.DataFrame) -> pd.DataFrame:
     """
-    For each cluster, query MeSH using the cluster's representative label.
-    This maps semantic clusters onto the established medical taxonomy.
+    For each cluster, query MeSH using the top keywords from that cluster
+    (not just the single centroid label). This dramatically improves match quality.
     """
     print("\n[5/6] Mapping clusters to MeSH taxonomy (NCBI free API)...")
-    print("      This may take a moment — rate limited to 3 req/sec per NCBI policy")
+    print("      Querying up to 6 keywords per cluster for best match quality...")
+    print("      Rate limited to ~3 req/sec per NCBI policy\n")
 
-    unique_labels = df["cluster_label"].dropna().unique()
-    mesh_results  = {}
+    # Build per-cluster keyword list (centroid first, then others)
+    cluster_kw_map = {}
+    for cid, group in df.groupby("cluster_id"):
+        label      = group["cluster_label"].iloc[0]
+        other_kws  = group["keyword"].tolist()
+        # Put the centroid label first, then the rest of the cluster keywords
+        all_kws    = [label] + [k for k in other_kws if k != label]
+        cluster_kw_map[cid] = all_kws
 
-    for i, label in enumerate(unique_labels):
-        print(f"      [{i+1}/{len(unique_labels)}] Querying MeSH: '{label}'", end="\r")
-        mesh_results[label] = query_mesh(label)
+    mesh_results = {}
+    cluster_ids  = sorted(cluster_kw_map.keys())
+
+    for i, cid in enumerate(cluster_ids):
+        label = df[df["cluster_id"] == cid]["cluster_label"].iloc[0]
+        print(f"      [{i+1}/{len(cluster_ids)}] Cluster: '{label}'", end="\r")
+        mesh_results[cid] = query_mesh_for_cluster(cluster_kw_map[cid])
 
     print()
 
-    df["mesh_term"]     = df["cluster_label"].map(
-        lambda x: mesh_results.get(x, {}).get("mesh_term"))
-    df["mesh_tree"]     = df["cluster_label"].map(
-        lambda x: mesh_results.get(x, {}).get("mesh_tree"))
-    df["mesh_category"] = df["cluster_label"].map(
-        lambda x: mesh_results.get(x, {}).get("mesh_category"))
+    df["mesh_term"]     = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_term"))
+    df["mesh_tree"]     = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_tree"))
+    df["mesh_category"] = df["cluster_id"].map(lambda x: mesh_results.get(x, {}).get("mesh_category"))
+
+    # Report coverage
+    mapped   = df["mesh_term"].notna().sum()
+    categd   = df["mesh_category"].notna().sum()
+    print(f"      → MeSH term found:     {df['cluster_id'].map(lambda x: mesh_results.get(x,{}).get('mesh_term')).notna().sum()} / {len(cluster_ids)} clusters")
+    print(f"      → MeSH category found: {df['cluster_id'].map(lambda x: mesh_results.get(x,{}).get('mesh_category')).notna().sum()} / {len(cluster_ids)} clusters")
 
     return df
 
