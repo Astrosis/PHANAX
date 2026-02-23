@@ -8,7 +8,9 @@ Output:
   - report.html          — visual summary you can open in a browser
 
 Dependencies (all free / open-source):
-    pip install sentence-transformers scikit-learn pandas numpy requests hdbscan umap-learn plotly
+    pip install sentence-transformers scikit-learn pandas numpy requests plotly
+
+    No hdbscan or umap-learn needed — clustering and reduction use scikit-learn only.
 
 Usage:
     python lifesci_keyword_pipeline.py --input keywords.txt
@@ -36,7 +38,7 @@ def parse_args():
     parser.add_argument("--col",    default="keyword", help="Column name if CSV (default: 'keyword')")
     parser.add_argument("--output", default="./output", help="Output directory (default: ./output)")
     parser.add_argument("--min-cluster-size", type=int, default=3,
-                        help="Min keywords per cluster for HDBSCAN (default: 3)")
+                        help="Min keywords per cluster for OPTICS (default: 3)")
     parser.add_argument("--top-n", type=int, default=20,
                         help="Top N research area recommendations to surface (default: 20)")
     return parser.parse_args()
@@ -100,59 +102,63 @@ def embed_keywords(df: pd.DataFrame) -> np.ndarray:
 
 def cluster_keywords(df: pd.DataFrame, embeddings: np.ndarray, min_cluster_size: int) -> pd.DataFrame:
     """
-    Reduce to 2D with UMAP then cluster with HDBSCAN.
-    HDBSCAN is preferred over k-means because:
-      - you don't need to specify k upfront
-      - it handles variable-density clusters well
-      - it marks genuine outliers as noise (label = -1)
+    Dimensionality reduction + clustering using scikit-learn only (no umap/hdbscan needed).
+
+    Pipeline:
+      1. TruncatedSVD → reduce high-dim embeddings to 50D  (fast, stable)
+      2. OPTICS       → density-based clustering on 50D     (no k needed, handles noise)
+      3. t-SNE        → reduce to 2D for visualization only
+
+    OPTICS (scikit-learn) is the closest free equivalent to HDBSCAN:
+      - automatically finds the number of clusters
+      - marks low-density points as noise (label = -1)
+      - handles clusters of varying density and shape
     """
-    print("\n[3/6] Reducing dimensions and clustering...")
+    print("\n[3/6] Reducing dimensions and clustering (scikit-learn)...")
 
-    try:
-        import umap
-    except ImportError:
-        raise ImportError("Run: pip install umap-learn")
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import OPTICS
+    from sklearn.manifold import TSNE
+    from sklearn.preprocessing import normalize
 
-    try:
-        import hdbscan
-    except ImportError:
-        raise ImportError("Run: pip install hdbscan")
+    # ── Step 1: TruncatedSVD to 50 components for clustering
+    n_components = min(50, embeddings.shape[1] - 1, embeddings.shape[0] - 1)
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    reduced_50d = svd.fit_transform(embeddings)
+    reduced_50d = normalize(reduced_50d)  # re-normalize after SVD
 
-    # UMAP: reduce to 10D for clustering (better than 2D for cluster quality)
-    reducer_cluster = umap.UMAP(
-        n_components=10,
-        n_neighbors=15,
-        min_dist=0.0,
-        metric="cosine",
-        random_state=42
-    )
-    reduced_10d = reducer_cluster.fit_transform(embeddings)
-
-    # UMAP: also reduce to 2D for visualization
-    reducer_viz = umap.UMAP(
-        n_components=2,
-        n_neighbors=15,
-        min_dist=0.1,
-        metric="cosine",
-        random_state=42
-    )
-    reduced_2d = reducer_viz.fit_transform(embeddings)
-
-    # HDBSCAN clustering
-    clusterer = hdbscan.HDBSCAN(
+    # ── Step 2: OPTICS clustering
+    #    min_samples   = min_cluster_size (same semantics as HDBSCAN's min_cluster_size)
+    #    xi            = steepness threshold for cluster boundary detection
+    #    min_cluster_size = fraction or int; controls smallest allowed cluster
+    clusterer = OPTICS(
+        min_samples=min_cluster_size,
         min_cluster_size=min_cluster_size,
-        min_samples=2,
-        metric="euclidean",
-        cluster_selection_method="eom"
+        xi=0.05,
+        metric="cosine",
+        n_jobs=-1
     )
-    labels = clusterer.fit_predict(reduced_10d)
+    labels = clusterer.fit_predict(reduced_50d)
 
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise    = (labels == -1).sum()
     print(f"    → {n_clusters} clusters found | {n_noise} keywords marked as noise")
 
+    # ── Step 3: t-SNE to 2D for visualization
+    print("    → Running t-SNE for visualization (this takes ~30s for large datasets)...")
+    perplexity = min(30, max(5, len(df) // 10))
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        learning_rate="auto",
+        init="pca",
+        random_state=42,
+        n_jobs=-1
+    )
+    reduced_2d = tsne.fit_transform(reduced_50d)
+
     df["cluster_id"] = labels
-    df["umap_x"]     = reduced_2d[:, 0]
+    df["umap_x"]     = reduced_2d[:, 0]   # column kept as umap_x for report compatibility
     df["umap_y"]     = reduced_2d[:, 1]
     return df
 
@@ -411,7 +417,7 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
             color="cluster_label",
             hover_data=["keyword", "mesh_term", "mesh_category"],
             title="Keyword Cluster Map — Life Science Research Areas",
-            labels={"umap_x": "UMAP-1", "umap_y": "UMAP-2"},
+            labels={"umap_x": "t-SNE 1", "umap_y": "t-SNE 2"},
             height=700,
             template="plotly_white"
         )
@@ -498,7 +504,7 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str):
 
   <p style="margin-top:40px;color:#aaa;font-size:0.8em">
     Generated by lifesci_keyword_pipeline.py — 
-    Embeddings: all-MiniLM-L6-v2 | Clustering: HDBSCAN | Taxonomy: NCBI MeSH
+    Embeddings: all-MiniLM-L6-v2 | Reduction: TruncatedSVD + t-SNE | Clustering: OPTICS | Taxonomy: NCBI MeSH
   </p>
 </body>
 </html>"""
