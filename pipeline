@@ -853,13 +853,20 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 
     work = df[df["research_area"] != "Unclassified / General Methods"].copy()
 
-    # Volume proxy: use search volume if available, else impressions, else count
+    # ── Volume: coerce everything to numeric first, then decide which column to use
+    for col in ["volume", "impressions"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+
     if "volume" in work.columns and work["volume"].sum() > 0:
         vol_col = "volume"
-    elif work["impressions"].sum() > 0:
+        print(f"    → Using search volume for demand scoring (total: {int(work['volume'].sum()):,})")
+    elif "impressions" in work.columns and work["impressions"].sum() > 0:
         vol_col = "impressions"
+        print(f"    → Using GSC impressions for demand scoring (total: {int(work['impressions'].sum()):,})")
     else:
         vol_col = None
+        print("    → No volume/impressions data — using keyword count for demand")
 
     agg_dict = dict(
         keyword_count        = ("keyword",            "count"),
@@ -960,7 +967,7 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════
 
 def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
-                    briefs_html: str = ""):
+                    briefs_html: str = "", serp_gaps_html: str = ""):
     print("\n    → Generating HTML report...")
 
     # ── Scatter coloured by research area
@@ -1112,6 +1119,8 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
 
   {briefs_html}
 
+  {serp_gaps_html}
+
   <p style="margin-top:40px;color:#aaa;font-size:0.78em">
     Model: all-MiniLM-L6-v2 &nbsp;|&nbsp;
     {len(RESEARCH_AREAS)} research areas (Tier 1: Neuroscience · Oncology · Immunology) &nbsp;|&nbsp;
@@ -1131,7 +1140,6 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
 # 9. CONTENT BRIEF GENERATOR
 # ═══════════════════════════════════════════════════════════════════════
 
-# Content type mapping: what format to recommend based on SERP signals
 CONTENT_TYPE_MAP = {
     "clinical":   "Clinical Deep-Dive",
     "guide":      "Practical Guide",
@@ -1143,91 +1151,296 @@ CONTENT_TYPE_MAP = {
     "unknown":    "Research Overview",
 }
 
-# Tone guidance based on academic lock score
+# Keywords that should never be used as a cluster label
+LABEL_BLOCKLIST = {
+    # Generic lab terms
+    "kit", "panel", "assay", "protocol", "reagent", "antibody", "buffer",
+    "solution", "product", "catalog", "item", "sample", "control", "standard",
+    "test", "tool", "service", "data", "analysis", "method", "technique",
+    "research", "study", "review", "paper", "article", "publication",
+    # Short noise
+    "a", "an", "the", "of", "in", "for", "and", "or", "with",
+    # Numeric / ID patterns handled separately via regex
+}
+
+def _is_valid_label(kw: str) -> bool:
+    """Return False if keyword looks like a product ID or generic noise."""
+    kw = kw.strip().lower()
+    # Too short
+    if len(kw) < 5:
+        return False
+    # Blocklisted
+    if kw in LABEL_BLOCKLIST:
+        return False
+    # Looks like a product code: has digits mixed with letters, or is all caps short
+    if re.match(r"^[a-z]{0,3}\d+", kw):           # e.g. ab12345, 9876
+        return False
+    if re.match(r"^[A-Z]{2,6}-?\d{3,}", kw):       # e.g. AB-1234, FLWPNL007
+        return False
+    if re.match(r"^\d", kw):                         # starts with digit
+        return False
+    # Contains suspicious patterns
+    if re.search(r"\d{4,}", kw):                     # long number sequence
+        return False
+    return True
+
+
+def _best_cluster_label(cluster: pd.DataFrame, c_emb: np.ndarray,
+                         centroid: np.ndarray) -> str:
+    """
+    Pick the cluster label keyword using centroid similarity,
+    but skip any keyword that fails the quality filter.
+    Falls back to the longest valid keyword if all centroid candidates fail.
+    """
+    sims  = c_emb @ centroid
+    order = sims.argsort()[::-1]   # highest similarity first
+    kws   = cluster["keyword"].tolist()
+
+    for idx in order:
+        kw = kws[idx]
+        if _is_valid_label(kw):
+            return kw
+
+    # Fallback: longest valid keyword in cluster
+    valid = [k for k in kws if _is_valid_label(k)]
+    if valid:
+        return max(valid, key=len)
+
+    # Last resort: just return the most common word in the cluster
+    all_words = " ".join(kws).split()
+    counts    = Counter(w for w in all_words if len(w) > 4)
+    if counts:
+        return counts.most_common(1)[0][0]
+    return kws[0]
+
+
+def _extract_topic_phrase(keywords: list[str]) -> str:
+    """
+    Extract the most informative 2-3 word phrase from a list of keywords
+    to use as the content angle. Prefers multi-word, biology-specific phrases.
+    """
+    # Score each keyword: longer multi-word phrases score higher,
+    # penalise single words and product-like strings
+    scored = []
+    for kw in keywords:
+        if not _is_valid_label(kw):
+            continue
+        words  = kw.split()
+        n      = len(words)
+        score  = n * 2                          # reward multi-word
+        score += min(len(kw), 30)               # reward longer strings
+        score -= sum(1 for w in words           # penalise generic words
+                     if w.lower() in LABEL_BLOCKLIST) * 3
+        scored.append((score, kw))
+
+    if not scored:
+        return keywords[0] if keywords else "Research Topic"
+
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+
+def _generate_title(topic: str, paa_questions: list[str], primary_gap: str,
+                    content_type: str, research_area: str,
+                    top_keywords: list[str], used_titles: set) -> str:
+    """
+    Generate a specific, non-repetitive title using multiple strategies:
+    1. PAA-first: turn the most specific PAA question into a title
+    2. Mechanism: "X: Mechanisms, Regulation & [Research|Clinical] Implications"
+    3. Comparative: "X vs Y: ..."
+    4. Application: how/why/what structure based on top keywords
+    Tracks used titles to avoid repetition.
+    """
+    area = research_area.split("/")[0].strip()
+    topic_title = topic.title()
+
+    # ── Strategy 1: PAA-first (most specific, reader-intent driven)
+    if paa_questions:
+        # Prefer questions that contain specific scientific terms
+        specific_qs = [
+            q for q in paa_questions
+            if len(q.split()) >= 5
+            and not any(g in q.lower() for g in ["what is", "what are", "define"])
+        ]
+        generic_qs = [q for q in paa_questions if q not in specific_qs]
+
+        for q in (specific_qs + generic_qs)[:5]:
+            q_clean = q.strip().rstrip("?")
+            if len(q_clean) > 20:
+                candidate = f"{q_clean}: Current Evidence and Research Directions"
+                if candidate not in used_titles:
+                    used_titles.add(candidate)
+                    return candidate
+
+    # ── Strategy 2: detect comparative angle from keywords
+    comparators = [k for k in top_keywords[:10]
+                   if " vs " in k.lower() or " versus " in k.lower()]
+    if comparators and primary_gap in ("Absence", "Performance"):
+        parts = re.split(r" vs | versus ", comparators[0], flags=re.IGNORECASE)
+        if len(parts) == 2:
+            candidate = f"{parts[0].strip().title()} vs {parts[1].strip().title()}: Mechanisms, Efficacy & Clinical Considerations"
+            if candidate not in used_titles:
+                used_titles.add(candidate)
+                return candidate
+
+    # ── Strategy 3: mechanism/pathway angle (best for absence gaps in research areas)
+    if primary_gap == "Absence":
+        templates = [
+            f"{topic_title}: Mechanisms, Regulation and Therapeutic Implications",
+            f"{topic_title}: From Molecular Biology to Clinical Applications",
+            f"The Role of {topic_title} in {area}: Current Research and Emerging Insights",
+            f"{topic_title}: Pathways, Biomarkers and Research Advances",
+        ]
+        for t in templates:
+            if t not in used_titles:
+                used_titles.add(t)
+                return t
+
+    # ── Strategy 4: performance gap — content exists but underperforms
+    if primary_gap == "Performance":
+        templates = [
+            f"{topic_title}: What Researchers Need to Know in {_current_year()}",
+            f"Advances in {topic_title}: Key Findings and Clinical Relevance",
+            f"{topic_title} Explained: Mechanisms, Methods and Current Evidence",
+        ]
+        for t in templates:
+            if t not in used_titles:
+                used_titles.add(t)
+                return t
+
+    # ── Strategy 5: PAA gap — question-led content
+    if primary_gap == "PAA" and paa_questions:
+        q = paa_questions[0].strip().rstrip("?")
+        templates = [
+            f"{q}: A Researcher's Guide",
+            f"{topic_title}: Answering the Key Questions in {area}",
+        ]
+        for t in templates:
+            if t not in used_titles:
+                used_titles.add(t)
+                return t
+
+    # ── Strategy 6: format gap — accessible explainer
+    if primary_gap == "Format":
+        templates = [
+            f"{topic_title}: A Practical Guide for {area} Research",
+            f"Understanding {topic_title}: Key Concepts and Applications",
+        ]
+        for t in templates:
+            if t not in used_titles:
+                used_titles.add(t)
+                return t
+
+    # ── Fallback with uniqueness guarantee
+    fallback = f"{topic_title}: Research Overview, Methods and Key Findings"
+    suffix   = 2
+    base     = fallback
+    while fallback in used_titles:
+        fallback = f"{base} (Part {suffix})"
+        suffix  += 1
+    used_titles.add(fallback)
+    return fallback
+
+
+def _current_year() -> str:
+    from datetime import datetime
+    return str(datetime.now().year)
+
+
 def _tone_from_lock(academic_lock: float) -> str:
     if academic_lock >= 0.7:
-        return "Technical / peer-reviewed depth — audience is active researchers"
+        return "Technical — written for active researchers and scientists"
     if academic_lock >= 0.4:
-        return "Balanced — suitable for research-aware professionals and scientists"
-    return "Accessible — suitable for broader scientific and clinical audience"
+        return "Balanced — research-aware professionals and clinicians"
+    return "Accessible — broader scientific and clinical audience"
 
-# Word count guidance based on format and academic lock
+
 def _wordcount(fmt: str, academic_lock: float) -> str:
-    if fmt == "clinical":
-        return "2,500–3,500"
-    if academic_lock >= 0.6:
-        return "2,000–3,000"
-    if fmt in ("guide", "listicle"):
-        return "1,500–2,500"
+    if fmt == "clinical":       return "2,500–3,500"
+    if academic_lock >= 0.6:    return "2,000–3,000"
+    if fmt in ("guide","listicle"): return "1,500–2,500"
     return "1,800–2,500"
 
-# Title angle generator based on sub-topic and gap type
-def _suggest_title(sub_topic: str, research_area: str, primary_gap: str,
-                   content_type: str, paa_sample: str) -> str:
-    sub = sub_topic.title()
-    area = research_area.split("/")[0].strip()
 
-    if primary_gap == "Absence":
-        return f"{sub}: A {content_type} for {area} Researchers"
-    if primary_gap == "Performance":
-        return f"{sub} — Key Mechanisms, Current Research & Clinical Relevance"
-    if primary_gap == "PAA" and paa_sample:
-        # Use the first PAA question as the title angle
-        q = paa_sample.split("|")[0].strip().rstrip("?")
-        return f"{q}: What the Latest Research Shows"
-    if primary_gap == "Format":
-        return f"Understanding {sub}: A Researcher's Guide"
-    if primary_gap == "Snippet":
-        return f"{sub}: Concise Overview for {area} Professionals"
-    return f"{sub}: Research Overview and Key Insights"
+def _recommend_structure(paa_questions: list[str], content_type: str,
+                          top_keywords: list[str]) -> str:
+    """
+    Suggest an article structure (H2 sections) based on PAA questions,
+    content type, and keyword themes. This is the core of what makes
+    a brief actually useful to a writer.
+    """
+    sections = []
+
+    # Always open with an intro section
+    sections.append("Introduction & Why This Topic Matters")
+
+    # If we have PAA questions, use them as H2s
+    if paa_questions:
+        for q in paa_questions[:4]:
+            q = q.strip().rstrip("?")
+            if q and len(q) > 10:
+                sections.append(q)
+
+    # Pad with inferred sections based on content type
+    if content_type == "Clinical Deep-Dive":
+        extras = ["Molecular Mechanisms", "Clinical Evidence & Trial Data",
+                  "Biomarkers & Patient Selection", "Current Challenges & Future Directions"]
+    elif content_type == "Practical Guide":
+        extras = ["Key Principles & Background", "Step-by-Step Methodology",
+                  "Troubleshooting & Best Practices", "Applications & Case Examples"]
+    elif content_type == "Educational Overview":
+        extras = ["Core Concepts & Definitions", "Biological Mechanisms",
+                  "Research Applications", "Open Questions in the Field"]
+    elif content_type == "Comparative Analysis":
+        extras = ["Mechanism of Action Comparison", "Clinical / Experimental Evidence",
+                  "Advantages & Limitations", "How to Choose: Decision Framework"]
+    else:
+        extras = ["Background & Context", "Key Research Findings",
+                  "Implications for Research & Practice", "Conclusion & Future Outlook"]
+
+    for e in extras:
+        if e not in sections and len(sections) < 7:
+            sections.append(e)
+
+    sections.append("Conclusion & Key Takeaways")
+
+    return " → ".join(sections)
 
 
 def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
                              recs: pd.DataFrame, output_dir: str,
                              n_briefs: int = 12) -> pd.DataFrame:
     """
-    Stage 9: Generate 10-15 prioritised content briefs.
+    Stage 9: Generate 10-15 prioritised, specific content briefs.
 
-    Approach:
-      1. For each research area (Tier 1 first), cluster keywords WITHIN
-         that area only — gives clean, area-specific sub-topics rather
-         than global clusters that bleed across areas.
-      2. Score each within-area cluster by: gap score, keyword count,
-         PAA richness, and snippet opportunity.
-      3. Select the top n_briefs clusters across all areas, respecting
-         tier weighting so Tier 1 areas aren't crowded out.
-      4. For each selected cluster, build a structured content brief:
-           - Suggested title
-           - Content type (guide/overview/clinical etc.)
-           - Target keywords (primary + secondary)
-           - PAA questions to answer (H2/H3 structure)
-           - Tone and word count guidance
-           - Gap type driving the recommendation
-           - Research area + secondary area if cross-cutting
+    Key improvements over v1:
+    - Cluster labels use quality-filtered keyword selection (no product IDs)
+    - Titles are generated with 6 strategies + deduplication tracker
+    - Each brief includes a suggested article structure (H2 sections)
+    - Topic phrase extraction prefers specific multi-word biology terms
+    - Per-area clustering keeps briefs cleanly scoped
     """
     print("\n[9/9] Generating content briefs...")
 
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import AgglomerativeClustering, KMeans
     from sklearn.preprocessing import normalize
-    from sklearn.metrics import pairwise_distances_argmin_min
 
-    # Only work with classified, gap-flagged keywords
+    # Only classified, meaningfully gapped keywords
     work = df[
         (df["research_area"] != "Unclassified / General Methods") &
-        (df["gap_score"] >= 0.15)
+        (df["gap_score"] >= 0.15) &
+        (df["keyword"].apply(_is_valid_label))   # filter product IDs at source
     ].copy()
 
     if len(work) == 0:
-        print("    → No gap keywords above threshold — skipping brief generation")
+        print("    → No valid gap keywords above threshold")
         return pd.DataFrame()
 
-    # Build tier lookup
-    tier_lookup = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
+    tier_lookup  = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
+    all_briefs   = []
+    used_titles  = set()   # deduplication across all briefs
 
-    all_briefs = []
-
-    # Process each research area independently
     areas_ordered = (
         recs.sort_values(["tier", "opportunity_score"], ascending=[True, False])
         ["research_area"].tolist()
@@ -1240,161 +1453,149 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         if len(area_df) < 3:
             continue
 
-        # ── Cluster WITHIN this area only
+        # ── Cluster within this area only
         area_indices = area_df.index.tolist()
-        area_emb     = kw_emb[area_indices]
+        a_emb        = kw_emb[area_indices]
         n            = len(area_df)
-
-        n_comp  = min(30, area_emb.shape[1] - 1, n - 1)
-        reduced = normalize(
-            TruncatedSVD(n_components=n_comp, random_state=42).fit_transform(area_emb)
+        n_comp       = min(30, a_emb.shape[1] - 1, n - 1)
+        reduced      = normalize(
+            TruncatedSVD(n_components=n_comp, random_state=42).fit_transform(a_emb)
         )
 
-        # k: 1 cluster per 6 keywords, bounded 2-15
         k = max(2, min(15, n // 6))
-
-        if n <= 500:
-            labels = AgglomerativeClustering(
-                n_clusters=k, metric="cosine", linkage="average"
-            ).fit_predict(reduced)
-        else:
-            labels = KMeans(
-                n_clusters=k, random_state=42, n_init="auto"
-            ).fit_predict(reduced)
+        labels = (
+            AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average")
+            .fit_predict(reduced)
+            if n <= 500 else
+            KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(reduced)
+        )
 
         area_df = area_df.copy()
         area_df["area_cluster"] = labels
 
-        # ── Score each within-area cluster
         for cid in np.unique(labels):
-            cluster_mask = area_df["area_cluster"] == cid
-            cluster      = area_df[cluster_mask]
+            c_mask  = area_df["area_cluster"] == cid
+            cluster = area_df[c_mask]
 
             if len(cluster) < 2:
                 continue
 
-            # Centroid keyword = cluster label
-            c_emb     = reduced[cluster_mask.values]
-            centroid  = c_emb.mean(axis=0)
-            sims      = c_emb @ centroid
-            label_kw  = cluster["keyword"].iloc[sims.argmax()]
+            c_emb    = reduced[c_mask.values]
+            centroid = c_emb.mean(axis=0)
 
-            # Aggregate signals
-            avg_gap      = cluster["gap_score"].mean()
-            kw_count     = len(cluster)
-            primary_gaps = cluster["primary_gap"].value_counts()
-            top_gap      = primary_gaps.index[0] if len(primary_gaps) else "Absence"
+            # ── Quality-filtered cluster label
+            label_kw = _best_cluster_label(cluster, c_emb, centroid)
 
-            # PAA: collect all unique questions across cluster keywords
+            # ── Topic phrase (best multi-word angle from cluster keywords)
+            valid_kws = [k for k in cluster["keyword"].tolist() if _is_valid_label(k)]
+            topic     = _extract_topic_phrase(valid_kws)
+
+            # ── Gap signals
+            avg_gap   = cluster["gap_score"].mean()
+            top_gap   = cluster["primary_gap"].value_counts().index[0] \
+                        if len(cluster["primary_gap"].value_counts()) else "Absence"
+
+            # ── PAA questions — deduplicated, quality-filtered
             all_paa = []
             for paa_str in cluster["paa_questions"].dropna():
                 for q in str(paa_str).split("|"):
                     q = q.strip()
-                    if q and q not in all_paa:
+                    if q and len(q) > 10 and q not in all_paa:
                         all_paa.append(q)
 
-            # Dominant format and academic lock
+            # ── Format and tone
             fmt_counts = cluster["dominant_format"].value_counts()
             dom_fmt    = fmt_counts.index[0] if len(fmt_counts) else "other"
             avg_lock   = cluster["academic_lock"].mean()
+            content_type = CONTENT_TYPE_MAP.get(dom_fmt, "Research Overview")
 
-            # Snippet opportunity
-            has_snippet = cluster.get("gap_snippet", pd.Series(False)).any()
-
-            # Cross-cutting: check if any keyword has a different research_area_2
-            if "research_area_2" in cluster.columns:
-                area2_counts = cluster["research_area_2"].value_counts()
-                cross_area   = (
-                    area2_counts.index[0]
-                    if len(area2_counts) and area2_counts.index[0] != area
-                    else ""
+            # ── Target keywords: valid only, sorted by impressions
+            if "impressions" in cluster.columns and cluster["impressions"].sum() > 0:
+                top_kws = (
+                    cluster[cluster["keyword"].apply(_is_valid_label)]
+                    .sort_values("impressions", ascending=False)
+                    ["keyword"].head(15).tolist()
                 )
             else:
-                cross_area = ""
+                top_kws = valid_kws[:15]
 
-            # Brief score: gap weighted by PAA richness and keyword count
-            paa_bonus   = min(0.15, len(all_paa) * 0.015)
+            # ── Snippet and cross-area
+            has_snippet = bool(cluster.get("gap_snippet", pd.Series(False)).any())
+            cross_area  = ""
+            if "research_area_2" in cluster.columns:
+                a2 = cluster["research_area_2"].value_counts()
+                if len(a2) and a2.index[0] != area:
+                    cross_area = a2.index[0]
+
+            # ── Generate non-repetitive title
+            title = _generate_title(
+                topic, all_paa, top_gap, content_type,
+                area, top_kws, used_titles
+            )
+
+            # ── Suggested article structure
+            structure = _recommend_structure(all_paa, content_type, top_kws)
+
+            # ── Brief score
+            paa_bonus     = min(0.15, len(all_paa) * 0.015)
             snippet_bonus = 0.05 if has_snippet else 0.0
             tier_bonus    = 0.10 if tier_lookup.get(area, 2) == 1 else 0.0
             brief_score   = avg_gap + paa_bonus + snippet_bonus + tier_bonus
 
-            # Top keywords: by impressions if available, else alphabetical
-            if "impressions" in cluster.columns and cluster["impressions"].sum() > 0:
-                top_kws = (
-                    cluster.sort_values("impressions", ascending=False)
-                    ["keyword"].head(12).tolist()
-                )
-            else:
-                top_kws = cluster["keyword"].head(12).tolist()
-
-            content_type  = CONTENT_TYPE_MAP.get(dom_fmt, "Research Overview")
-            paa_sample    = all_paa[0] if all_paa else ""
-            suggested_title = _suggest_title(
-                label_kw, area, top_gap, content_type, paa_sample
-            )
-
             all_briefs.append({
-                "brief_score":      round(brief_score, 3),
-                "research_area":    area,
-                "tier":             tier_lookup.get(area, 2),
-                "sub_topic":        label_kw,
-                "cross_area":       cross_area,
-                "suggested_title":  suggested_title,
-                "content_type":     content_type,
-                "primary_gap":      top_gap,
-                "keyword_count":    kw_count,
-                "primary_keyword":  top_kws[0] if top_kws else label_kw,
-                "secondary_keywords": " | ".join(top_kws[1:8]),
+                "brief_score":         round(brief_score, 3),
+                "research_area":       area,
+                "tier":                tier_lookup.get(area, 2),
+                "topic":               topic,
+                "cross_area":          cross_area,
+                "suggested_title":     title,
+                "content_type":        content_type,
+                "primary_gap":         top_gap,
+                "keyword_count":       len(cluster),
+                "primary_keyword":     top_kws[0] if top_kws else topic,
+                "secondary_keywords":  " | ".join(top_kws[1:8]),
                 "all_target_keywords": " | ".join(top_kws),
-                "paa_questions":    " | ".join(all_paa[:8]),
-                "paa_count":        len(all_paa),
-                "tone":             _tone_from_lock(avg_lock),
-                "word_count":       _wordcount(dom_fmt, avg_lock),
-                "academic_lock":    round(avg_lock, 2),
-                "avg_gap_score":    round(avg_gap, 3),
-                "has_snippet_opp":  has_snippet,
-                "recommended_action": (
-                    "🆕 Create"         if top_gap == "Absence"     else
-                    "🔧 Optimise"       if top_gap == "Performance" else
+                "paa_questions":       " | ".join(all_paa[:8]),
+                "paa_count":           len(all_paa),
+                "suggested_structure": structure,
+                "tone":                _tone_from_lock(avg_lock),
+                "word_count":          _wordcount(dom_fmt, avg_lock),
+                "academic_lock":       round(avg_lock, 2),
+                "avg_gap_score":       round(avg_gap, 3),
+                "has_snippet_opp":     has_snippet,
+                "recommended_action":  (
+                    "🆕 Create"          if top_gap == "Absence"     else
+                    "🔧 Optimise"        if top_gap == "Performance" else
                     "❓ Add PAA content" if top_gap == "PAA"         else
-                    "📋 Reformat"       if top_gap == "Format"      else
+                    "📋 Reformat"        if top_gap == "Format"      else
                     "⭐ Win Snippet"
                 ),
             })
 
     if not all_briefs:
-        print("    → No briefs generated — check gap threshold")
+        print("    → No briefs generated — check gap threshold or keyword quality")
         return pd.DataFrame()
 
     briefs_df = pd.DataFrame(all_briefs)
 
-    # ── Select top n_briefs, weighted toward Tier 1 areas
-    # Ensure at least 1 brief per area that has data
-    selected = []
-    seen_areas = set()
+    # ── Select top n_briefs: guarantee 1 per area, then fill by score
+    selected    = []
+    seen_areas  = set()
 
-    # First pass: top brief per area (guaranteed representation)
-    for _, row in (
-        briefs_df.sort_values(["tier", "brief_score"], ascending=[True, False])
-        .iterrows()
-    ):
+    for _, row in briefs_df.sort_values(
+        ["tier", "brief_score"], ascending=[True, False]
+    ).iterrows():
         if row["research_area"] not in seen_areas:
-            selected.append(row)
+            selected.append(row.to_dict())
             seen_areas.add(row["research_area"])
 
-    # Second pass: fill remaining slots with highest scoring remaining briefs
-    used_idx = {id(r) for r in selected}
-    remaining = briefs_df[
-        ~briefs_df.index.isin([
-            i for i, r in briefs_df.iterrows()
-            if any(r.equals(s) for s in selected)
-        ])
-    ].sort_values("brief_score", ascending=False)
-
-    for _, row in remaining.iterrows():
+    selected_titles = {r["suggested_title"] for r in selected}
+    for _, row in briefs_df.sort_values("brief_score", ascending=False).iterrows():
         if len(selected) >= n_briefs:
             break
-        selected.append(row)
+        if row["suggested_title"] not in selected_titles:
+            selected.append(row.to_dict())
+            selected_titles.add(row["suggested_title"])
 
     briefs_out = (
         pd.DataFrame(selected)
@@ -1404,12 +1605,10 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
     briefs_out.index += 1
     briefs_out.index.name = "brief_rank"
 
-    # ── Save CSV
     briefs_path = os.path.join(output_dir, "content_briefs.csv")
     briefs_out.to_csv(briefs_path)
-    print(f"    → {len(briefs_out)} content briefs generated")
+    print(f"    → {len(briefs_out)} content briefs generated → {briefs_path}")
 
-    # ── Print summary to terminal
     print("\n📝  Content Briefs:\n")
     for rank, row in briefs_out.iterrows():
         tier_tag = "⭐" if row["tier"] == 1 else "  "
@@ -1418,15 +1617,14 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         print(f"       {row['content_type']} · {row['recommended_action']} · "
               f"{row['keyword_count']} keywords · {row['word_count']} words")
         if row["paa_count"] > 0:
-            first_q = row["paa_questions"].split("|")[0].strip()
+            first_q = str(row["paa_questions"]).split("|")[0].strip()
             print(f"       PAA ({row['paa_count']} Qs): {first_q}...")
         print()
 
     return briefs_out
 
 
-def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str):
-    """Add a content briefs section to the HTML report."""
+def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str) -> str:
     if briefs_df is None or len(briefs_df) == 0:
         return ""
 
@@ -1439,84 +1637,119 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str):
             "<span style='background:#6c757d;color:white;border-radius:4px;"
             "padding:2px 8px;font-size:0.75em;margin-right:6px'>Tier 2</span>"
         )
-        cross = (
-            f"<span style='font-size:0.8em;color:#6c757d'>"
-            f"Also relevant: {row['cross_area']}</span><br>"
+        cross_html = (
+            f"<span style='font-size:0.8em;color:#6c757d'> · Also: {row['cross_area']}</span>"
             if row.get("cross_area") else ""
         )
-        paa_items = ""
+
+        # PAA questions as structured list
+        paa_html = ""
         if row.get("paa_questions"):
-            for q in str(row["paa_questions"]).split("|")[:5]:
-                q = q.strip()
-                if q:
-                    paa_items += f"<li style='margin:3px 0'>{q}</li>"
-            paa_items = (
-                f"<div style='margin-top:10px'>"
-                f"<strong style='font-size:0.85em;color:#495057'>PAA Questions to Answer:</strong>"
-                f"<ul style='margin:4px 0 0 0;padding-left:18px;font-size:0.83em;color:#555'>"
-                f"{paa_items}</ul></div>"
+            items = "".join(
+                f"<li style='margin:3px 0'>{q.strip()}</li>"
+                for q in str(row["paa_questions"]).split("|")[:6]
+                if q.strip()
+            )
+            if items:
+                paa_html = (
+                    f"<div style='margin-top:12px'>"
+                    f"<strong style='font-size:0.84em;color:#495057'>"
+                    f"PAA Questions to Answer ({row['paa_count']} total):</strong>"
+                    f"<ul style='margin:4px 0 0 0;padding-left:18px;"
+                    f"font-size:0.82em;color:#555'>{items}</ul></div>"
+                )
+
+        # Suggested structure
+        structure_html = ""
+        if row.get("suggested_structure"):
+            steps = str(row["suggested_structure"]).split(" → ")
+            step_items = "".join(
+                f"<span style='background:#f0f4f8;border-radius:4px;padding:3px 8px;"
+                f"font-size:0.78em;margin:2px;display:inline-block'>"
+                f"<strong>{i+1}.</strong> {s}</span>"
+                for i, s in enumerate(steps)
+            )
+            structure_html = (
+                f"<div style='margin-top:12px'>"
+                f"<strong style='font-size:0.84em;color:#495057'>Suggested Structure:</strong>"
+                f"<div style='margin-top:5px;line-height:1.8'>{step_items}</div></div>"
             )
 
-        kws = str(row.get("all_target_keywords", "")).split("|")
+        # Target keywords as tags
+        kws    = str(row.get("all_target_keywords", "")).split("|")
         kw_tags = "".join(
-            f"<span style='background:#e8f4fd;border-radius:3px;padding:2px 6px;"
+            f"<span style='background:#e8f4fd;border-radius:3px;padding:2px 7px;"
             f"font-size:0.78em;margin:2px;display:inline-block'>{k.strip()}</span>"
-            for k in kws[:10] if k.strip()
+            for k in kws[:12] if k.strip()
         )
 
         gap_colour = {
-            "Absence":    "#dc3545",
-            "Performance":"#fd7e14",
-            "PAA":        "#0077b6",
-            "Format":     "#6610f2",
-            "Snippet":    "#198754",
+            "Absence":     "#dc3545",
+            "Performance": "#fd7e14",
+            "PAA":         "#0077b6",
+            "Format":      "#6610f2",
+            "Snippet":     "#198754",
         }.get(row["primary_gap"], "#6c757d")
 
+        snippet_html = (
+            "<div style='margin-top:10px;font-size:0.8em;background:#fff3cd;"
+            "border-radius:4px;padding:6px 10px'>"
+            "⭐ Featured snippet opportunity — aim for a direct answer in the opening paragraph"
+            "</div>"
+            if row.get("has_snippet_opp") else ""
+        )
+
         cards += f"""
-        <div style='background:white;border-radius:12px;padding:20px 24px;
-                    box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:20px;
-                    border-left:4px solid {gap_colour}'>
-          <div style='display:flex;align-items:flex-start;justify-content:space-between;
-                      flex-wrap:wrap;gap:8px'>
+        <div style='background:white;border-radius:12px;padding:22px 26px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:24px;
+                    border-left:5px solid {gap_colour}'>
+
+          <div style='display:flex;align-items:center;justify-content:space-between;
+                      flex-wrap:wrap;gap:8px;margin-bottom:8px'>
             <div>
               {tier_badge}
-              <span style='font-size:0.82em;color:#6c757d'>{row['research_area']}</span>
-              {f"<span style='font-size:0.82em;color:#6c757d'> · {row['cross_area']}</span>" if row.get('cross_area') else ""}
+              <span style='font-size:0.83em;color:#495057;font-weight:600'>
+                {row['research_area']}</span>{cross_html}
             </div>
-            <div style='display:flex;gap:8px;flex-wrap:wrap'>
+            <div style='display:flex;gap:6px;flex-wrap:wrap'>
               <span style='background:{gap_colour};color:white;border-radius:4px;
-                           padding:2px 8px;font-size:0.78em'>{row['primary_gap']} Gap</span>
+                           padding:2px 9px;font-size:0.78em'>{row['primary_gap']} Gap</span>
               <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
-                           padding:2px 8px;font-size:0.78em'>{row['content_type']}</span>
+                           padding:2px 9px;font-size:0.78em'>{row['content_type']}</span>
               <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
-                           padding:2px 8px;font-size:0.78em'>{row['word_count']} words</span>
+                           padding:2px 9px;font-size:0.78em'>{row['word_count']} words</span>
+              <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
+                           padding:2px 9px;font-size:0.78em'>{row['recommended_action']}</span>
             </div>
           </div>
 
-          <h3 style='margin:10px 0 4px 0;color:#0d1b2a;font-size:1.05em'>
-            #{rank} {row['suggested_title']}
+          <h3 style='margin:0 0 6px 0;color:#0d1b2a;font-size:1.08em;line-height:1.4'>
+            <span style='color:{gap_colour};margin-right:6px'>#{rank}</span>
+            {row['suggested_title']}
           </h3>
-          <div style='font-size:0.83em;color:#6c757d;margin-bottom:10px'>
-            {row['recommended_action']} &nbsp;·&nbsp;
+
+          <div style='font-size:0.82em;color:#6c757d;margin-bottom:14px'>
             {row['keyword_count']} target keywords &nbsp;·&nbsp;
             Tone: {row['tone']}
           </div>
 
-          <div style='margin-bottom:8px'>
-            <strong style='font-size:0.85em;color:#495057'>Target Keywords:</strong><br>
-            <div style='margin-top:4px'>{kw_tags}</div>
+          <div>
+            <strong style='font-size:0.84em;color:#495057'>Target Keywords:</strong><br>
+            <div style='margin-top:5px'>{kw_tags}</div>
           </div>
 
-          {paa_items}
-
-          {"<div style='margin-top:10px;font-size:0.8em;background:#fff3cd;border-radius:4px;padding:6px 10px'>⭐ Featured snippet opportunity exists for this cluster</div>" if row.get('has_snippet_opp') else ""}
+          {structure_html}
+          {paa_html}
+          {snippet_html}
         </div>"""
 
     return f"""
   <h2>📝 Content Briefs ({len(briefs_df)} Recommendations)</h2>
-  <div style='margin-bottom:16px;font-size:0.88em;color:#555'>
+  <div style='margin-bottom:16px;font-size:0.87em;color:#555;
+              background:#f8f9fa;border-radius:8px;padding:12px 16px'>
     Briefs are ranked by opportunity score within each tier.
-    Border colour indicates primary gap type:
+    Each brief includes a suggested article structure derived from PAA questions and content type.
+    Border colour = primary gap:
     <span style='color:#dc3545'>■ Absence</span> &nbsp;
     <span style='color:#fd7e14'>■ Performance</span> &nbsp;
     <span style='color:#0077b6'>■ PAA</span> &nbsp;
@@ -1524,6 +1757,447 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str):
     <span style='color:#198754'>■ Snippet</span>
   </div>
   {cards}"""
+
+# ═══════════════════════════════════════════════════════════════════════
+# 10. SERP TITLE MINING — CONTENT ANGLE GAP ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════
+
+def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
+                          model, n_gaps: int = 12) -> tuple:
+    """
+    Stage 10: Data-mine SERP titles to find content angles that are either:
+      A) Heavily represented in top-ranking titles but you have no presence
+      B) Raised in PAA questions but addressed by NO top-ranking title
+
+    This is fundamentally different from keyword gap analysis (Stage 7-9).
+    Stage 7-9 asks: "where are you absent from search results?"
+    Stage 10 asks: "what do the search results reveal that nobody has written well?"
+
+    Approach per research area:
+      1. Explode enriched_text back into individual SERP titles
+      2. Embed all titles as a corpus (not as keyword enrichment — as content units)
+      3. Cluster the title corpus to find what themes Google is rewarding
+      4. For each title cluster:
+           - Summarise what the cluster covers (pattern from titles)
+           - Check your GSC presence (avg position for mapped keywords)
+           - Find PAA questions that don't match any title cluster centroid
+             → these are the uncontested angles
+      5. Score each gap by: search demand × your absence × PAA signal strength
+      6. Output structured gap briefs: what exists, what's missing, why it wins
+
+    Proxy for "your content": GSC position ≤ 10 on mapped keywords = you have coverage.
+    Position > 20 or no impressions = you're absent from that topic.
+    """
+    print("\n[10/10] Mining SERP titles for content angle gaps...")
+
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.preprocessing import normalize
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # ── Build the SERP title corpus
+    # Each row in df has an enriched_text = "keyword | title1 | title2 | ..."
+    # Explode back to individual titles, tagged with their keyword's research area
+
+    title_rows = []
+
+    for _, row in df.iterrows():
+        area     = row.get("research_area", "")
+        keyword  = row.get("keyword", "")
+        position = float(row.get("position", 999))
+        impressions = float(row.get("impressions", 0))
+
+        if area == "Unclassified / General Methods" or not area:
+            continue
+
+        # Get titles from enriched_text (pipe-separated) or title_N columns
+        enriched = str(row.get("enriched_text", ""))
+        if "|" in enriched:
+            parts  = [p.strip() for p in enriched.split("|")]
+            titles = parts[1:]   # skip the keyword itself (first element)
+        else:
+            title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
+            titles = [str(row.get(c, "")).strip()
+                      for c in title_cols if pd.notna(row.get(c)) and str(row.get(c)).strip()]
+
+        # Get PAA questions
+        paa_str = str(row.get("paa_questions", ""))
+        paas    = [q.strip() for q in paa_str.split("|") if q.strip() and len(q.strip()) > 8]
+
+        for title in titles:
+            if title and len(title) > 10 and title.lower() != keyword:
+                title_rows.append({
+                    "title":       title,
+                    "keyword":     keyword,
+                    "research_area": area,
+                    "position":    position,
+                    "impressions": impressions,
+                    "paa_questions": paa_str,
+                    "paas":        paas,
+                })
+
+    if not title_rows:
+        print("    → No SERP titles available for mining")
+        return pd.DataFrame(), ""
+
+    titles_df = pd.DataFrame(title_rows)
+    print(f"    → {len(titles_df)} SERP title instances across "
+          f"{titles_df['research_area'].nunique()} research areas")
+
+    # ── Embed the title corpus
+    print("    → Embedding SERP title corpus...")
+    unique_titles = titles_df["title"].drop_duplicates().tolist()
+    title_embs    = model.encode(
+        unique_titles,
+        show_progress_bar=False,
+        batch_size=128,
+        normalize_embeddings=True
+    )
+    title_emb_map = {t: e for t, e in zip(unique_titles, title_embs)}
+    titles_df["emb_idx"] = titles_df["title"].map(
+        {t: i for i, t in enumerate(unique_titles)}
+    )
+
+    all_gaps = []
+
+    for area in titles_df["research_area"].unique():
+        area_titles = titles_df[titles_df["research_area"] == area].copy()
+        n = len(area_titles)
+
+        if n < 5:
+            continue
+
+        # ── Cluster the title corpus for this area
+        embs = np.array([title_emb_map[t] for t in area_titles["title"]])
+        n_comp   = min(20, embs.shape[1] - 1, n - 1)
+        reduced  = normalize(
+            TruncatedSVD(n_components=n_comp, random_state=42).fit_transform(embs)
+        )
+
+        k = max(3, min(12, n // 8))
+        labels = AgglomerativeClustering(
+            n_clusters=k, metric="cosine", linkage="average"
+        ).fit_predict(reduced)
+
+        area_titles = area_titles.copy()
+        area_titles["title_cluster"] = labels
+
+        # ── Collect all PAA questions for this area (deduplicated)
+        all_area_paa = []
+        for paa_list in area_titles["paas"].tolist():
+            for q in paa_list:
+                if q and q not in all_area_paa:
+                    all_area_paa.append(q)
+
+        # Embed PAA questions if we have them
+        paa_embs = None
+        if all_area_paa:
+            paa_embs = model.encode(
+                all_area_paa,
+                show_progress_bar=False,
+                normalize_embeddings=True
+            )
+
+        # ── Analyse each title cluster
+        for cid in np.unique(labels):
+            c_mask   = area_titles["title_cluster"] == cid
+            cluster  = area_titles[c_mask]
+            c_embs   = embs[c_mask.values]
+            centroid = c_embs.mean(axis=0)
+            centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+
+            # What do these titles cover? Extract representative titles
+            sims        = c_embs @ centroid
+            top_idx     = sims.argsort()[::-1][:5]
+            rep_titles  = cluster["title"].iloc[top_idx].tolist()
+
+            # Pattern: find common words/phrases across rep titles
+            def extract_pattern(titles: list) -> str:
+                """Find what themes recur across the top titles in a cluster."""
+                all_words = Counter()
+                for t in titles:
+                    words = re.findall(r"\b[a-zA-Z]{4,}\b", t.lower())
+                    all_words.update(words)
+                # Remove noise words
+                noise = {"with", "from", "that", "this", "have", "been",
+                         "their", "they", "were", "what", "which", "when",
+                         "after", "before", "about", "into", "your", "more"}
+                top_words = [w for w, _ in all_words.most_common(8)
+                             if w not in noise]
+                return ", ".join(top_words[:5]) if top_words else "mixed"
+
+            pattern     = extract_pattern(rep_titles)
+            cluster_label = rep_titles[0] if rep_titles else f"Cluster {cid}"
+
+            # ── Your presence: avg position for keywords mapping to this cluster
+            # Keywords "map" to this cluster if their position is tracked
+            cluster_kws     = cluster.drop_duplicates("keyword")
+            your_positions  = cluster_kws[cluster_kws["position"] < 999]["position"]
+            your_impressions= cluster_kws["impressions"].sum()
+
+            if len(your_positions) > 0:
+                avg_pos = your_positions.mean()
+            else:
+                avg_pos = 999   # no presence
+
+            you_are_absent = avg_pos > 20 or your_impressions == 0
+
+            # ── Find uncontested PAA angles
+            # PAA questions that are semantically distant from ALL title cluster centroids
+            uncontested_paa = []
+            if paa_embs is not None and len(all_area_paa) > 0:
+                # Compute all cluster centroids for this area
+                all_centroids = []
+                for other_cid in np.unique(labels):
+                    other_mask = area_titles["title_cluster"] == other_cid
+                    other_embs = embs[other_mask.values]
+                    c = other_embs.mean(axis=0)
+                    c = c / (np.linalg.norm(c) + 1e-9)
+                    all_centroids.append(c)
+                all_centroids = np.array(all_centroids)
+
+                # For each PAA question, find its max similarity to any title cluster
+                paa_cluster_sims = paa_embs @ all_centroids.T
+                max_sims         = paa_cluster_sims.max(axis=1)
+
+                # PAA questions with low similarity to all clusters = uncontested
+                for q, max_sim in zip(all_area_paa, max_sims):
+                    if max_sim < 0.45:   # no cluster strongly covers this question
+                        uncontested_paa.append(q)
+
+            # ── Score this gap
+            # Higher score = more valuable to create content for
+            absence_score  = 1.0 if avg_pos == 999 else max(0, (avg_pos - 10) / 90)
+            demand_score   = min(1.0, your_impressions / 5000) if your_impressions > 0 else 0.3
+            paa_score      = min(1.0, len(uncontested_paa) * 0.2)
+            title_coverage = len(cluster) / max(len(area_titles), 1)  # how big this theme is
+
+            gap_score = (
+                absence_score  * 0.40 +
+                title_coverage * 0.25 +
+                paa_score      * 0.20 +
+                demand_score   * 0.15
+            )
+
+            # ── Determine gap type
+            if not you_are_absent:
+                gap_type = "Angle Gap"   # topic exists, specific angle missing
+                gap_explanation = (
+                    f"You rank for some keywords in this area (avg position {avg_pos:.0f}) "
+                    f"but the SERP shows {len(cluster)} titles on this theme — "
+                    f"a more targeted piece could outrank broader coverage."
+                )
+            elif uncontested_paa:
+                gap_type = "Uncontested Angle"
+                gap_explanation = (
+                    f"This theme has {len(cluster)} competing titles but "
+                    f"{len(uncontested_paa)} PAA questions that none of them answer well. "
+                    f"Content that directly addresses these questions has a clear opening."
+                )
+            else:
+                gap_type = "Topic Void"
+                gap_explanation = (
+                    f"You have no presence on this theme ({len(cluster)} SERP titles exist). "
+                    f"Creating foundational content here captures demand with no direct competition "
+                    f"from your existing pages."
+                )
+
+            # ── Generate suggested title from the missing angle
+            if uncontested_paa:
+                # Title comes from the uncontested PAA question
+                best_q   = uncontested_paa[0].rstrip("?")
+                title_suggestion = (
+                    f"{best_q}: Evidence, Mechanisms and Research Implications"
+                )
+            else:
+                # Title comes from what's missing — deeper angle on the cluster theme
+                words = pattern.split(", ")
+                topic = " ".join(w.title() for w in words[:3]) if words else cluster_label
+                title_suggestion = (
+                    f"{topic}: A Deep-Dive into Mechanisms, Current Evidence "
+                    f"and Research Directions"
+                )
+
+            # What existing titles cover (shown in brief)
+            existing_coverage = " · ".join(
+                t[:60] + "..." if len(t) > 60 else t
+                for t in rep_titles[:4]
+            )
+
+            all_gaps.append({
+                "gap_score":          round(gap_score, 3),
+                "research_area":      area,
+                "gap_type":           gap_type,
+                "gap_explanation":    gap_explanation,
+                "suggested_title":    title_suggestion,
+                "theme_pattern":      pattern,
+                "serp_title_count":   len(cluster),
+                "your_avg_position":  round(avg_pos, 1) if avg_pos < 999 else "No presence",
+                "uncontested_paa":    " | ".join(uncontested_paa[:5]),
+                "uncontested_paa_count": len(uncontested_paa),
+                "existing_coverage":  existing_coverage,
+                "rep_titles":         " · ".join(rep_titles[:3]),
+                "keywords_in_theme":  " | ".join(cluster["keyword"].drop_duplicates().head(10).tolist()),
+            })
+
+    if not all_gaps:
+        print("    → No content angle gaps identified")
+        return pd.DataFrame(), ""
+
+    gaps_df = (
+        pd.DataFrame(all_gaps)
+        .sort_values("gap_score", ascending=False)
+        .head(n_gaps)
+        .reset_index(drop=True)
+    )
+    gaps_df.index += 1
+    gaps_df.index.name = "gap_rank"
+
+    # ── Save
+    gaps_path = os.path.join(output_dir, "serp_content_gaps.csv")
+    gaps_df.to_csv(gaps_path)
+    print(f"    → {len(gaps_df)} content angle gaps identified → {gaps_path}")
+
+    # ── Terminal summary
+    print("\n🔍  SERP Content Angle Gaps:\n")
+    for rank, row in gaps_df.iterrows():
+        gap_icon = {"Uncontested Angle": "🎯", "Topic Void": "⬛",
+                    "Angle Gap": "↗️"}.get(row["gap_type"], "•")
+        print(f"  {rank:>2}. {gap_icon} [{row['research_area']}] {row['gap_type']}")
+        print(f"       {row['suggested_title']}")
+        print(f"       SERP coverage: {row['serp_title_count']} titles · "
+              f"Your position: {row['your_avg_position']}")
+        if row["uncontested_paa_count"] > 0:
+            first = str(row["uncontested_paa"]).split("|")[0].strip()
+            print(f"       Uncontested: {first}...")
+        print()
+
+    # ── Build HTML section
+    gap_cards = ""
+    for rank, row in gaps_df.iterrows():
+        gap_colour = {
+            "Uncontested Angle": "#0077b6",
+            "Topic Void":        "#dc3545",
+            "Angle Gap":         "#fd7e14",
+        }.get(row["gap_type"], "#6c757d")
+
+        gap_icon = {
+            "Uncontested Angle": "🎯",
+            "Topic Void":        "⬛",
+            "Angle Gap":         "↗️",
+        }.get(row["gap_type"], "•")
+
+        # Uncontested PAA as list
+        paa_html = ""
+        if row.get("uncontested_paa"):
+            items = "".join(
+                f"<li style='margin:3px 0;color:#0077b6'>{q.strip()}</li>"
+                for q in str(row["uncontested_paa"]).split("|")[:5]
+                if q.strip()
+            )
+            if items:
+                paa_html = (
+                    f"<div style='margin-top:12px'>"
+                    f"<strong style='font-size:0.84em;color:#495057'>"
+                    f"❓ Uncontested questions — not answered by any top-ranking page:</strong>"
+                    f"<ul style='margin:4px 0 0 0;padding-left:18px;"
+                    f"font-size:0.82em'>{items}</ul></div>"
+                )
+
+        # What currently ranks
+        existing_html = ""
+        if row.get("rep_titles"):
+            items = "".join(
+                f"<li style='margin:2px 0;color:#6c757d'>{t.strip()}</li>"
+                for t in str(row["rep_titles"]).split("·")[:3]
+                if t.strip()
+            )
+            existing_html = (
+                f"<div style='margin-top:12px'>"
+                f"<strong style='font-size:0.84em;color:#495057'>"
+                f"📄 What currently ranks on this theme:</strong>"
+                f"<ul style='margin:4px 0 0 0;padding-left:18px;"
+                f"font-size:0.82em;font-style:italic'>{items}</ul></div>"
+            )
+
+        # Keyword tags
+        kws = str(row.get("keywords_in_theme", "")).split("|")
+        kw_tags = "".join(
+            f"<span style='background:#f0f4f8;border-radius:3px;padding:2px 7px;"
+            f"font-size:0.78em;margin:2px;display:inline-block'>{k.strip()}</span>"
+            for k in kws[:10] if k.strip()
+        )
+
+        pos_display = row["your_avg_position"]
+        pos_colour  = "#dc3545" if pos_display == "No presence" else (
+            "#198754" if isinstance(pos_display, float) and pos_display <= 10 else "#fd7e14"
+        )
+
+        gap_cards += f"""
+        <div style='background:white;border-radius:12px;padding:22px 26px;
+                    box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:24px;
+                    border-left:5px solid {gap_colour}'>
+
+          <div style='display:flex;align-items:center;justify-content:space-between;
+                      flex-wrap:wrap;gap:8px;margin-bottom:10px'>
+            <div>
+              <span style='background:{gap_colour};color:white;border-radius:4px;
+                           padding:2px 10px;font-size:0.8em;margin-right:8px'>
+                {gap_icon} {row["gap_type"]}
+              </span>
+              <span style='font-size:0.83em;color:#495057;font-weight:600'>
+                {row["research_area"]}
+              </span>
+            </div>
+            <div style='display:flex;gap:6px;flex-wrap:wrap;font-size:0.78em'>
+              <span style='background:#f8f9fa;border:1px solid #dee2e6;
+                           border-radius:4px;padding:2px 8px'>
+                {row["serp_title_count"]} competing titles
+              </span>
+              <span style='background:#f8f9fa;border:1px solid #dee2e6;
+                           border-radius:4px;padding:2px 8px;color:{pos_colour}'>
+                Your position: {pos_display}
+              </span>
+            </div>
+          </div>
+
+          <h3 style='margin:0 0 6px 0;color:#0d1b2a;font-size:1.06em;line-height:1.4'>
+            <span style='color:{gap_colour}'># {rank}</span> &nbsp;
+            {row["suggested_title"]}
+          </h3>
+
+          <div style='font-size:0.83em;color:#555;background:#f8f9fa;
+                      border-radius:6px;padding:8px 12px;margin:10px 0;
+                      border-left:3px solid {gap_colour}'>
+            {row["gap_explanation"]}
+          </div>
+
+          <div style='margin-top:10px'>
+            <strong style='font-size:0.84em;color:#495057'>Related keywords:</strong>
+            <div style='margin-top:5px'>{kw_tags}</div>
+          </div>
+
+          {existing_html}
+          {paa_html}
+        </div>"""
+
+    serp_gaps_html = f"""
+  <h2>🔍 SERP Content Angle Gaps ({len(gaps_df)} Identified)</h2>
+  <div style='margin-bottom:16px;font-size:0.87em;color:#555;
+              background:#f8f9fa;border-radius:8px;padding:12px 16px'>
+    These gaps are derived from mining what top-ranking SERP titles cover —
+    not from keyword demand alone. They represent topics where either
+    no content exists, a specific angle is unaddressed, or PAA questions
+    go unanswered by any current top-ranking page.
+    <br><br>
+    <span style='color:#dc3545'>■ Topic Void</span> — theme has SERP presence but you have none &nbsp;
+    <span style='color:#0077b6'>■ Uncontested Angle</span> — PAA questions unanswered by top pages &nbsp;
+    <span style='color:#fd7e14'>■ Angle Gap</span> — you rank but a deeper angle is available
+  </div>
+  {gap_cards}"""
+
+    return gaps_df, serp_gaps_html
+
 
 def main():
     args = parse_args()
@@ -1557,12 +2231,21 @@ def main():
     briefs_df   = generate_content_briefs(df, kw_emb, recs, args.output, n_briefs=12)
     briefs_html = generate_briefs_html(briefs_df, args.output)
 
+    # ── Stage 10: SERP title mining — content angle gaps
+    # Re-use the same sentence transformer model (already loaded in Stage 3)
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
+        df, args.output, model, n_gaps=12
+    )
+
     # ── Save outputs
-    drop_cols     = ["tsne_x", "tsne_y", "enriched_text"]
-    clusters_path = os.path.join(args.output, "clusters.csv")
-    gaps_path     = os.path.join(args.output, "gaps.csv")
-    recs_path     = os.path.join(args.output, "recommendations.csv")
-    briefs_path   = os.path.join(args.output, "content_briefs.csv")
+    drop_cols          = ["tsne_x", "tsne_y", "enriched_text"]
+    clusters_path      = os.path.join(args.output, "clusters.csv")
+    gaps_path          = os.path.join(args.output, "gaps.csv")
+    recs_path          = os.path.join(args.output, "recommendations.csv")
+    briefs_path        = os.path.join(args.output, "content_briefs.csv")
+    serp_gaps_path     = os.path.join(args.output, "serp_content_gaps.csv")
 
     df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
 
@@ -1579,15 +2262,18 @@ def main():
     )
 
     recs.to_csv(recs_path)
-    generate_report(df, recs, args.output, briefs_html=briefs_html)
+    generate_report(df, recs, args.output,
+                    briefs_html=briefs_html,
+                    serp_gaps_html=serp_gaps_html)
 
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
-    print(f"   clusters.csv        → {clusters_path}")
-    print(f"   gaps.csv            → {gaps_path}")
-    print(f"   recommendations.csv → {recs_path}")
-    print(f"   content_briefs.csv  → {briefs_path}")
-    print(f"   report.html         → {os.path.join(args.output, 'report.html')}")
+    print(f"   clusters.csv          → {clusters_path}")
+    print(f"   gaps.csv              → {gaps_path}")
+    print(f"   recommendations.csv   → {recs_path}")
+    print(f"   content_briefs.csv    → {briefs_path}")
+    print(f"   serp_content_gaps.csv → {serp_gaps_path}")
+    print(f"   report.html           → {os.path.join(args.output, 'report.html')}")
     print("═" * 62)
 
     print("\n📋  Top Research Area Recommendations:\n")
