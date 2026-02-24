@@ -2146,13 +2146,14 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             top_gap   = cluster["primary_gap"].value_counts().index[0] \
                         if len(cluster["primary_gap"].value_counts()) else "Absence"
 
-            # ── PAA questions — deduplicated, quality-filtered, relevance-gated
+            # ── PAA questions — deduplicated, quality-filtered
+            # (keywords are already classified to a research area so PAAs
+            #  are implicitly in-domain; no per-question encode needed)
             all_paa = []
             for paa_str in cluster["paa_questions"].dropna():
                 for q in str(paa_str).split("|"):
                     q = q.strip()
-                    if (q and len(q) > 10 and q not in all_paa
-                            and _is_relevant(q, area_emb, model)):
+                    if q and len(q) > 10 and q not in all_paa:
                         all_paa.append(q)
 
             # ── Format and tone
@@ -2469,7 +2470,7 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         enriched = str(row.get("enriched_text", ""))
         if "|" in enriched:
             parts  = [p.strip() for p in enriched.split("|")]
-            titles = parts[1:]   # skip the keyword itself (first element)
+            titles = parts[1:]
         else:
             title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
             titles = [str(row.get(c, "")).strip()
@@ -2480,8 +2481,7 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         paas    = [q.strip() for q in paa_str.split("|") if q.strip() and len(q.strip()) > 8]
 
         for title in titles:
-            if (title and len(title) > 10 and title.lower() != keyword
-                    and _is_relevant(title, area_emb, model)):
+            if title and len(title) > 10 and title.lower() != keyword:
                 title_rows.append({
                     "title":         title,
                     "keyword":       keyword,
@@ -2497,17 +2497,41 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         return pd.DataFrame(), ""
 
     titles_df = pd.DataFrame(title_rows)
-    print(f"    → {len(titles_df)} SERP title instances across "
+    print(f"    → {len(titles_df):,} raw title instances across "
           f"{titles_df['research_area'].nunique()} research areas")
 
-    # ── Embed the title corpus
+    # ── Embed all unique titles in ONE batch, then batch-score relevance
+    # This replaces the old per-title _is_relevant() calls which encoded
+    # one string at a time — 111k individual model calls vs. one batched encode.
     unique_titles = titles_df["title"].drop_duplicates().tolist()
     title_embs    = cached_encode(
         unique_titles, model, _EMB_CACHE_DIR,
         label=f"SERP titles ({len(unique_titles):,} unique)",
         batch_size=256,
     )
-    title_emb_map = {t: e for t, e in zip(unique_titles, title_embs)}
+    title_emb_map  = {t: e for t, e in zip(unique_titles, title_embs)}
+
+    # Batch relevance score: max cosine sim to any research area
+    # area_emb shape: (n_areas, 384) — one row per research area description
+    unique_emb_matrix = np.array([title_emb_map[t] for t in unique_titles])
+    # (n_unique_titles, n_areas) — one sim score per title per area
+    rel_sims    = unique_emb_matrix @ area_emb.T
+    max_rel_sim = rel_sims.max(axis=1)   # best match to any area
+
+    relevant_titles = {
+        t for t, sim in zip(unique_titles, max_rel_sim)
+        if sim >= RELEVANCE_THRESHOLD
+    }
+    n_before = len(titles_df)
+    titles_df = titles_df[titles_df["title"].isin(relevant_titles)].copy()
+    n_removed = n_before - len(titles_df)
+    print(f"    → {n_removed:,} titles removed by relevance gate "
+          f"({len(titles_df):,} remain, threshold={RELEVANCE_THRESHOLD})")
+
+    if len(titles_df) == 0:
+        print("    → No relevant titles remain after filtering")
+        return pd.DataFrame(), ""
+
     titles_df["emb_idx"] = titles_df["title"].map(
         {t: i for i, t in enumerate(unique_titles)}
     )
@@ -2536,22 +2560,31 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         area_titles = area_titles.copy()
         area_titles["title_cluster"] = labels
 
-        # ── Collect PAA questions — deduplicated and relevance-gated
-        all_area_paa = []
+        # ── Collect PAA questions — deduplicated, then batch relevance-score
+        raw_paa = []
         for paa_list in area_titles["paas"].tolist():
             for q in paa_list:
-                if (q and q not in all_area_paa
-                        and _is_relevant(q, area_emb, model)):
-                    all_area_paa.append(q)
+                if q and q not in raw_paa:
+                    raw_paa.append(q)
 
-        # Embed PAA questions if we have them
-        paa_embs = None
-        if all_area_paa:
-            paa_embs = model.encode(
-                all_area_paa,
+        # Batch-encode all PAA questions once, then filter by relevance
+        # (avoids one model call per question — could be thousands)
+        all_area_paa = []
+        paa_embs     = None
+        if raw_paa:
+            paa_embs_all = cached_encode(
+                raw_paa, model, _EMB_CACHE_DIR,
+                label=f"PAA ({area[:30]})",
+                batch_size=256,
                 show_progress_bar=False,
-                normalize_embeddings=True
             )
+            paa_rel = (paa_embs_all @ area_emb.T).max(axis=1)
+            all_area_paa = [q for q, s in zip(raw_paa, paa_rel)
+                            if s >= RELEVANCE_THRESHOLD]
+            if all_area_paa:
+                keep_idx = [i for i, s in enumerate(paa_rel)
+                            if s >= RELEVANCE_THRESHOLD]
+                paa_embs = paa_embs_all[keep_idx]
 
         # ── Analyse each title cluster
         for cid in np.unique(labels):
