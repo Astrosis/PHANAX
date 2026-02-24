@@ -463,35 +463,81 @@ def _normalise_keyword(s: str) -> str:
 BRAND_TERMS = [
     # Abcam and misspellings
     "abcam", "abcamm", "abcam's", "abcamn", "ab cam",
-    # Add competitor brands below as you find them:
-    # "thermo fisher", "thermofisher", "thermosfisher",
-    # "cell signaling", "cst antibody",
-    # "biolegend", "bio-legend",
-    # "miltenyi", "milteny",
-    # "r&d systems", "r and d systems",
-    # "santa cruz", "santacruz",
+    # Thermo Fisher / Invitrogen
+    "thermo fisher", "thermofisher", "thermosfisher", "thermo scientific",
+    "invitrogen", "gibco", "nunc", "pierce",
+    # Cell Signaling Technology
+    "cell signaling technology", "cell signaling", "cst antibody", "cellsignal",
+    # Bio-Techne / R&D Systems
+    "bio-techne", "biotechne", "r&d systems", "r and d systems", "rndsystems",
+    # Biolegend
+    "biolegend", "bio-legend", "bio legend",
+    # Novus Biologicals
+    "novus biologicals", "novusbio", "novus bio",
+    # Santa Cruz Biotechnology
+    "santa cruz biotechnology", "santa cruz biotech", "scbt", "sc-biosciences",
+    # Sigma-Aldrich / Merck (commercial reagent context)
+    "sigma-aldrich", "sigmaaldrich", "sigma aldrich", "millipore", "emd millipore",
+    "emdmillipore", "merck millipore",
+    # Miltenyi
+    "miltenyi biotec", "miltenyi", "milteny",
+    # ProteinTech
+    "proteintech", "ptglab",
+    # BioCompare
+    "biocompare",
+    # Other common reagent brands
+    "bd biosciences", "bd pharmingen", "becton dickinson",
+    "biorad", "bio-rad", "bio rad",
+    "qiagen", "promega", "neb", "new england biolabs",
+    "lifetech", "life technologies",
+    "jackson immunoresearch", "jackson immuno",
+    "rockland immunochemicals", "rockland antibodies",
+    "bethyl laboratories", "bethyl labs",
+    "genscript", "gen script",
+    "origene", "sino biological",
+    "peprotech", "pepro tech",
+    "stemcell technologies", "stemcell tech",
+    "lonza", "corning life sciences",
+    "cayman chemical", "tocris",
+    "enzo life sciences", "enzo biochem",
+    "epitomics", "abgent", "abnova",
+    "bioss antibodies", "bioss",
+    "lsbio", "ls bio",
+    "gentex", "creative biolabs",
 ]
 
 NAVIGATIONAL_TERMS = [
-    # Databases and portals people search by name
-    "pubmed", "ncbi", "uniprot", "ensembl", "kegg", "reactome",
+    # Databases and portals people navigate to directly
+    "pubmed", "ncbi", "ncbi pubmed", "nih pubmed",
+    "uniprot", "ensembl", "kegg", "reactome",
     "gene ontology", "gene cards", "genecards",
-    "clinicaltrials.gov", "clinical trials gov",
-    "pdb", "rcsb",
-    # Add more as needed:
-    # "string db", "biogrid", "intact",
+    "clinicaltrials.gov", "clinical trials gov", "clinicaltrials",
+    "pdb", "rcsb pdb", "protein data bank",
+    "string db", "string database", "biogrid", "intact",
+    "omim", "online mendelian inheritance",
+    "cosmic", "cosmic database",
+    "tcga", "geo database", "gdc portal",
+    "atlas gtex", "gtex", "human protein atlas",
+    "biomart", "ensembl biomart",
+    "cellxgene", "single cell portal",
+    "addgene", "depositor addgene",
 ]
 
 REGEX_FILTERS = [
-    # Product/catalog codes: letters + 4+ digits e.g. ab12345, PA5-12345
+    # Abcam-style product codes: ab + 1-6 digits (must be whole keyword)
+    r"^ab\d{1,6}$",
+    # Generic catalog codes: 1-4 letters + 4+ digits, optionally with dash
     r"^[a-z]{1,4}[\-]?\d{4,}$",
+    # Codes like PA5-12345, GTX-12345, bs-1234R
+    r"^[a-z]{2,5}[\-]\d{3,}[a-z]{0,3}$",
     # Pure numeric strings
     r"^\d+$",
+    # CAS registry numbers: digits-digits-digit
+    r"^\d{2,7}[\-]\d{2,3}[\-]\d$",
+    # Lot numbers
+    r"^lot\s+\d+",
     # Email addresses
     r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",
-    # Add more patterns as needed:
-    # r"^lot\s+\d+",          # lot numbers
-    # r"cas\s+\d+[\-]\d+",    # CAS registry numbers
 ]
 
 # Compile regex filters once at import time
@@ -1837,9 +1883,7 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
         avg_serp_diversity   = ("serp_diversity",     "mean"),
         absence_gap_count    = ("gap_absence",        "sum"),
         performance_gap_count= ("gap_performance",   "sum"),
-        format_gap_count     = ("gap_format",         "sum"),
         paa_gap_count        = ("gap_paa",            "sum"),
-        snippet_gap_count    = ("gap_snippet",        "sum"),
         sample_keywords      = ("keyword",            lambda x: " | ".join(list(x)[:8])),
         sub_topics           = ("cluster_label",      lambda x: " · ".join(
                                  x.value_counts().head(5).index.tolist())),
@@ -1850,6 +1894,76 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 
     area_df = work.groupby("research_area").agg(**agg_dict).reset_index()
 
+    # ── Impression-weighted gap score
+    # Simple mean of gap_score ignores that a keyword with 50k impressions and
+    # an absence gap is worth far more than one with 10 impressions.
+    # Weighted: sum(gap_score × impressions) / sum(impressions)
+    if "impressions" in work.columns and work["impressions"].sum() > 0:
+        work["_gap_x_imp"] = work["gap_score"] * work["impressions"].clip(lower=1)
+        imp_weighted = work.groupby("research_area").agg(
+            _sum_gap_x_imp = ("_gap_x_imp",   "sum"),
+            _sum_imp       = ("impressions",   "sum"),
+        )
+        imp_weighted["imp_weighted_gap"] = (
+            imp_weighted["_sum_gap_x_imp"] / imp_weighted["_sum_imp"].clip(lower=1)
+        ).round(3)
+        area_df = area_df.merge(
+            imp_weighted[["imp_weighted_gap"]], on="research_area", how="left"
+        )
+    else:
+        area_df["imp_weighted_gap"] = area_df["avg_gap_score"]
+
+    # ── PAA coverage rate — what % of keywords have PAA questions
+    # High coverage = strong question demand = informational content is wanted
+    area_df["paa_coverage"] = (
+        area_df["paa_gap_count"] / area_df["keyword_count"] * 100
+    ).round(1)
+
+    # ── Position distribution signals
+    pos_stats = (
+        work[work["position"] < 999]
+        .groupby("research_area")["position"]
+        .agg(
+            median_position = "median",
+            pct_page2       = lambda x: (((x >= 11) & (x <= 20)).sum() / len(x) * 100),
+        )
+        .round(1)
+    )
+    area_df = area_df.merge(pos_stats, on="research_area", how="left")
+    area_df["median_position"] = area_df["median_position"].fillna(999).round(1)
+    area_df["pct_page2"]       = area_df["pct_page2"].fillna(0).round(1)
+
+    # ── Keyword concentration index — top 3 keywords' share of area impressions
+    # High concentration = area dominated by 1-2 head terms, risky if they slip
+    if vol_col:
+        def _top3_share(grp):
+            total = grp[vol_col].sum()
+            if total == 0:
+                return 0.0
+            return round(grp.nlargest(3, vol_col)[vol_col].sum() / total * 100, 1)
+        conc = work.groupby("research_area").apply(_top3_share).rename("top3_imp_share")
+        area_df = area_df.merge(conc.reset_index(), on="research_area", how="left")
+    else:
+        area_df["top3_imp_share"] = None
+
+    # ── AIO displacement risk — % of area keywords with AI Overview data
+    if "aio_cluster_id" in work.columns:
+        aio_stats = (
+            work.groupby("research_area")
+            .agg(_has_aio = ("aio_cluster_id", lambda x: (x >= 0).sum()))
+            .reset_index()
+        )
+        aio_stats["aio_coverage_pct"] = (
+            aio_stats["_has_aio"] /
+            area_df.set_index("research_area").loc[aio_stats["research_area"], "keyword_count"].values
+            * 100
+        ).round(1)
+        area_df = area_df.merge(
+            aio_stats[["research_area", "aio_coverage_pct"]], on="research_area", how="left"
+        )
+    else:
+        area_df["aio_coverage_pct"] = None
+
 
     # ── Normalise demand
     if vol_col:
@@ -1857,27 +1971,18 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
     else:
         area_df["demand_score"] = area_df["keyword_count"] / area_df["keyword_count"].max()
 
-    # ── Winnability: rescale serp_diversity to 0-1 first, then combine with academic lock
-    # serp_diversity raw range is ~0.33-1.0 (min 1 distinct / 3 titles)
-    # rescaling ensures winnability can actually reach 1.0
-    sd_min = area_df["avg_serp_diversity"].min()
-    sd_max = area_df["avg_serp_diversity"].max()
-    if sd_max > sd_min:
-        area_df["avg_serp_diversity_scaled"] = (
-            (area_df["avg_serp_diversity"] - sd_min) / (sd_max - sd_min)
-        )
-    else:
-        area_df["avg_serp_diversity_scaled"] = 0.5
-
-    area_df["winnability"] = (
-        (1 - area_df["avg_academic_lock"]) * area_df["avg_serp_diversity_scaled"]
-    ).clip(0, 1).round(3)
+    # ── Winnability: PAA coverage rate normalised 0-1
+    # Replaces the old academic_lock × serp_diversity formula which was noise.
+    # High PAA coverage = Google wants question-driven informational content here
+    # = easier to win with well-structured FAQ-heavy content.
+    area_df["winnability"] = (area_df["paa_coverage"] / 100).clip(0, 1).round(3)
 
     # ── Opportunity score
+    # Uses impression-weighted gap score in place of simple mean
     area_df["opportunity_score"] = (
-        area_df["demand_score"]  * 0.45 +
-        area_df["avg_gap_score"] * 0.35 +
-        area_df["winnability"]   * 0.20
+        area_df["demand_score"]       * 0.45 +
+        area_df["imp_weighted_gap"]   * 0.35 +
+        area_df["winnability"]        * 0.20
     ).round(3)
 
     # ── Gap percentages
@@ -1928,68 +2033,148 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════
 
 def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
+                    kw_emb: np.ndarray = None,
                     briefs_html: str = "", serp_gaps_html: str = "",
                     visibility_html: str = ""):
     print("\n    → Generating HTML report...")
 
-    # ── Hierarchical bubble map: Research Area → Cluster → Keywords
-    # Three-level sunburst/treemap: area (parent) > cluster (child) > keyword (leaf)
-    # Size = impressions (or 1 if no impressions)
+    # ── Keyword scatter map: PCA of embeddings → x/y coordinates
+    # Each keyword = one dot, coloured by research area, symbol by gap type,
+    # size by impressions. Much more visually informative than a treemap —
+    # you can see semantic proximity, area clusters, and gap distribution at once.
     try:
         import plotly.express as px
         import plotly.io as pio
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import normalize as sk_normalize
 
         plot_df = df.copy()
-        plot_df["impressions_sz"] = (
-            pd.to_numeric(plot_df.get("impressions", 0), errors="coerce")
-            .fillna(0)
-            .clip(lower=1)
-        )
-        plot_df["area"]    = plot_df["research_area"].fillna("Unclassified")
-        plot_df["cluster"] = plot_df["primary_cluster_label"].fillna("Unknown")
-        plot_df["kw"]      = plot_df["keyword"]
-        plot_df["gap"]     = plot_df.get("primary_gap", "Unknown").fillna("Unknown")
-        plot_df["pos"]     = pd.to_numeric(
-            plot_df.get("position", 999), errors="coerce"
-        ).fillna(999).round(1)
+        plot_df = plot_df[plot_df["research_area"] != "Unclassified / General Methods"]
 
-        # Remove unclassified to keep map clean
-        plot_df = plot_df[plot_df["area"] != "Unclassified / General Methods"]
+        # PCA on keyword embeddings for x/y — deterministic, fast, no stochastic noise
+        # Use the kw_emb passed in; fall back to recomputing from enriched_text if absent
+        kw_emb_plot = kw_emb if kw_emb is not None else None
 
-        # Treemap: area > cluster > keyword
-        # Each keyword leaf sized by impressions, coloured by gap type
-        fig = px.treemap(
-            plot_df,
-            path=["area", "cluster", "kw"],
-            values="impressions_sz",
-            color="gap",
-            color_discrete_map={
-                "Absence":     "#dc3545",
-                "Performance": "#fd7e14",
-                "PAA":         "#0077b6",
-                "Format":      "#6610f2",
-                "Snippet":     "#198754",
-                "None":        "#adb5bd",
-            },
-            hover_data={"pos": True, "impressions_sz": True, "gap": True},
-            title="Keyword Map — Research Area → Cluster → Keyword",
-            height=900,
-        )
-        fig.update_traces(
-            textinfo="label",
-            hovertemplate=(
-                "<b>%{label}</b><br>"
-                "Gap: %{color}<br>"
-                "Position: %{customdata[0]}<br>"
-                "Impressions: %{customdata[1]:,}<br>"
-                "<extra></extra>"
-            ),
-        )
-        fig.update_layout(
-            margin=dict(t=50, l=10, r=10, b=10),
-            template="plotly_white",
-        )
-        scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
+        if kw_emb_plot is not None and len(kw_emb_plot) == len(df):
+            # Filter to classified rows only — keep original df index alignment
+            classified_mask = df["research_area"] != "Unclassified / General Methods"
+            emb_subset = kw_emb_plot[classified_mask.values]
+            emb_norm   = sk_normalize(emb_subset)
+
+            n_samples = len(emb_norm)
+            n_comp    = min(2, n_samples - 1, emb_norm.shape[1])
+
+            if n_comp == 2:
+                pca = PCA(n_components=2, random_state=42)
+                coords = pca.fit_transform(emb_norm)
+                plot_df = plot_df.reset_index(drop=True)
+                plot_df["pca_x"] = coords[:, 0]
+                plot_df["pca_y"] = coords[:, 1]
+                has_coords = True
+            else:
+                has_coords = False
+        else:
+            has_coords = False
+
+        if has_coords:
+            plot_df["impressions_sz"] = (
+                pd.to_numeric(plot_df.get("impressions", 0), errors="coerce")
+                .fillna(0).clip(lower=1)
+            )
+            plot_df["gap"]  = plot_df.get("primary_gap", "None").fillna("None")
+            plot_df["pos"]  = pd.to_numeric(
+                plot_df.get("position", 999), errors="coerce"
+            ).fillna(999).round(1)
+            plot_df["cluster"] = plot_df.get("primary_cluster_label", "").fillna("")
+
+            # Cap marker size to keep small-impression keywords visible
+            plot_df["marker_sz"] = (
+                plot_df["impressions_sz"].clip(upper=5000) / 500 + 3
+            ).clip(3, 15)
+
+            AREA_COLORS = [
+                "#0077b6","#e63946","#2a9d8f","#e9c46a","#f4a261",
+                "#6a4c93","#43aa8b","#f77f00","#023e8a","#d62828",
+                "#606c38","#bc6c25","#7b2d8b","#1d7874","#ee6c4d",
+            ]
+            areas = sorted(plot_df["research_area"].unique())
+            area_color_map = {a: AREA_COLORS[i % len(AREA_COLORS)]
+                              for i, a in enumerate(areas)}
+
+            GAP_SYMBOLS = {
+                "Absence":     "circle",
+                "Performance": "diamond",
+                "PAA":         "square",
+                "Format":      "triangle-up",
+                "Snippet":     "cross",
+                "None":        "circle-open",
+            }
+
+            fig = px.scatter(
+                plot_df,
+                x="pca_x", y="pca_y",
+                color="research_area",
+                symbol="gap",
+                size="marker_sz",
+                size_max=15,
+                color_discrete_map=area_color_map,
+                symbol_map=GAP_SYMBOLS,
+                hover_name="keyword",
+                hover_data={
+                    "research_area": True,
+                    "cluster":       True,
+                    "gap":           True,
+                    "pos":           True,
+                    "impressions_sz":True,
+                    "pca_x":         False,
+                    "pca_y":         False,
+                    "marker_sz":     False,
+                },
+                labels={
+                    "pca_x":         "← Semantic Axis 1 →",
+                    "pca_y":         "← Semantic Axis 2 →",
+                    "research_area": "Research Area",
+                    "gap":           "Gap Type",
+                    "pos":           "Your Position",
+                    "impressions_sz":"Impressions",
+                    "cluster":       "Cluster",
+                },
+                title="Keyword Map — Semantic Space, Coloured by Research Area, Shaped by Gap Type",
+                height=750,
+                template="plotly_white",
+            )
+            fig.update_traces(
+                marker=dict(line=dict(width=0.5, color="rgba(0,0,0,0.3)")),
+            )
+            fig.update_layout(
+                margin=dict(t=60, l=10, r=10, b=10),
+                legend=dict(
+                    orientation="v", x=1.01, y=1,
+                    font=dict(size=11),
+                ),
+                xaxis=dict(showticklabels=False, showgrid=True,
+                           gridcolor="#f0f0f0", zeroline=False),
+                yaxis=dict(showticklabels=False, showgrid=True,
+                           gridcolor="#f0f0f0", zeroline=False),
+            )
+            scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
+        else:
+            # Fallback treemap if embeddings not available
+            plot_df["impressions_sz"] = (
+                pd.to_numeric(plot_df.get("impressions", 0), errors="coerce")
+                .fillna(0).clip(lower=1)
+            )
+            plot_df["area"]    = plot_df["research_area"].fillna("Unclassified")
+            plot_df["cluster"] = plot_df.get("primary_cluster_label", "").fillna("Unknown")
+            plot_df["kw"]      = plot_df["keyword"]
+            plot_df["gap"]     = plot_df.get("primary_gap", "Unknown").fillna("Unknown")
+            fig = px.treemap(
+                plot_df, path=["area", "cluster", "kw"],
+                values="impressions_sz", color="gap",
+                title="Keyword Map — Research Area → Cluster → Keyword",
+                height=750,
+            )
+            scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
 
         # Gap breakdown bar chart (unchanged)
         gap_data = pd.DataFrame({
@@ -2434,8 +2619,11 @@ def _cluster_relevance_score(text: str, area_emb: np.ndarray, model) -> float:
 
 
 # Minimum cosine similarity to research area taxonomy for a cluster
-# or PAA question to be included in briefs / gaps
-RELEVANCE_THRESHOLD = 0.22
+# or PAA question to be included in briefs / gaps.
+# 0.22 was too permissive — allowed "Did Ted Bundy have MAOA gene" type
+# queries through because "gene" bumped similarity above the floor.
+# 0.28 eliminates these while keeping genuine edge-case life-sci queries.
+RELEVANCE_THRESHOLD = 0.28
 
 
 def _is_relevant(text: str, area_emb: np.ndarray, model,
@@ -2444,6 +2632,36 @@ def _is_relevant(text: str, area_emb: np.ndarray, model,
     if not text or len(text.strip()) < 8:
         return False
     return _cluster_relevance_score(text, area_emb, model) >= threshold
+
+
+def _cluster_is_high_quality(cluster: pd.DataFrame, area_name: str,
+                              min_classified_pct: float = 0.5) -> bool:
+    """
+    Secondary quality gate applied to each cluster before generating a brief.
+
+    Rules:
+    1. At least 50% of the cluster's keywords must be classified into a
+       real research area (not Unclassified / General Methods).
+       Prevents junk clusters built from oddly-matched low-quality keywords.
+    2. At least 1 keyword in the cluster must belong to the correct area.
+       Prevents cross-area bleed where the brief topic doesn't match the
+       area heading it appears under.
+    """
+    total = len(cluster)
+    if total == 0:
+        return False
+
+    # Rule 1: majority must be classified
+    classified = (cluster["research_area"] != "Unclassified / General Methods").sum()
+    if classified / total < min_classified_pct:
+        return False
+
+    # Rule 2: at least one keyword must actually belong to this area
+    in_area = (cluster["research_area"] == area_name).sum()
+    if in_area == 0:
+        return False
+
+    return True
 
 
 def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
@@ -2477,10 +2695,11 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         print("    → No valid gap keywords above threshold")
         return pd.DataFrame()
 
-    tier_lookup  = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
-    all_briefs   = []
-    used_titles  = set()
-    rejected     = 0
+    tier_lookup   = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
+    all_briefs    = []
+    used_titles   = set()
+    used_paa      = set()   # global PAA dedup — same question won't appear in 2 briefs
+    rejected      = 0
 
     areas_ordered = (
         recs.sort_values(["tier", "opportunity_score"], ascending=[True, False])
@@ -2536,25 +2755,36 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
                 rejected += 1
                 continue
 
+            # ── Quality gate — reject clusters where majority of keywords
+            # are unclassified or don't actually belong to this area
+            if not _cluster_is_high_quality(cluster, area):
+                rejected += 1
+                continue
+
             # ── Gap signals
             avg_gap   = cluster["gap_score"].mean()
             top_gap   = cluster["primary_gap"].value_counts().index[0] \
                         if len(cluster["primary_gap"].value_counts()) else "Absence"
 
-            # ── PAA questions — deduplicated, quality-filtered
-            # (keywords are already classified to a research area so PAAs
-            #  are implicitly in-domain; no per-question encode needed)
+            # ── PAA questions — deduplicated locally AND globally
+            # Global dedup: same PAA question appearing in multiple briefs
+            # confuses writers — each question should belong to one brief.
             all_paa = []
             for paa_str in cluster["paa_questions"].dropna():
                 for q in str(paa_str).split("|"):
                     q = q.strip()
-                    if q and len(q) > 10 and q not in all_paa:
+                    norm_q = _normalise_for_dedup(q)
+                    if (q and len(q) > 10
+                            and q not in all_paa
+                            and norm_q not in used_paa):
                         all_paa.append(q)
+            # Register these PAAs as used globally
+            for q in all_paa:
+                used_paa.add(_normalise_for_dedup(q))
 
-            # ── Format and tone
-            fmt_counts = cluster["dominant_format"].value_counts()
-            dom_fmt    = fmt_counts.index[0] if len(fmt_counts) else "other"
-            avg_lock   = cluster["academic_lock"].mean()
+            # ── Format
+            fmt_counts   = cluster["dominant_format"].value_counts()
+            dom_fmt      = fmt_counts.index[0] if len(fmt_counts) else "other"
             content_type = CONTENT_TYPE_MAP.get(dom_fmt, "Research Article")
 
             # ── Target keywords: valid only, sorted by impressions
@@ -2567,14 +2797,6 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             else:
                 top_kws = valid_kws[:15]
 
-            # ── Snippet and cross-area
-            has_snippet = bool(cluster.get("gap_snippet", pd.Series(False)).any())
-            cross_area  = ""
-            if "research_area_2" in cluster.columns:
-                a2 = cluster["research_area_2"].value_counts()
-                if len(a2) and a2.index[0] != area:
-                    cross_area = a2.index[0]
-
             # ── Generate non-repetitive title
             title = _generate_title(
                 topic, all_paa, top_gap, content_type,
@@ -2585,17 +2807,15 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             structure = _recommend_structure(all_paa, content_type, top_kws)
 
             # ── Brief score
-            paa_bonus     = min(0.15, len(all_paa) * 0.015)
-            snippet_bonus = 0.05 if has_snippet else 0.0
-            tier_bonus    = 0.10 if tier_lookup.get(area, 2) == 1 else 0.0
-            brief_score   = avg_gap + paa_bonus + snippet_bonus + tier_bonus
+            paa_bonus  = min(0.15, len(all_paa) * 0.015)
+            tier_bonus = 0.10 if tier_lookup.get(area, 2) == 1 else 0.0
+            brief_score = avg_gap + paa_bonus + tier_bonus
 
             all_briefs.append({
                 "brief_score":         round(brief_score, 3),
                 "research_area":       area,
                 "tier":                tier_lookup.get(area, 2),
                 "topic":               topic,
-                "cross_area":          cross_area,
                 "suggested_title":     title,
                 "content_type":        content_type,
                 "primary_gap":         top_gap,
@@ -2606,11 +2826,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
                 "paa_questions":       " | ".join(all_paa[:8]),
                 "paa_count":           len(all_paa),
                 "suggested_structure": structure,
-                "tone":                _tone_from_lock(avg_lock),
-                "word_count":          _wordcount(dom_fmt, avg_lock),
-                "academic_lock":       round(avg_lock, 2),
                 "avg_gap_score":       round(avg_gap, 3),
-                "has_snippet_opp":     has_snippet,
                 "recommended_action":  (
                     "Create"              if top_gap == "Absence"     else
                     "🔧 Optimise"        if top_gap == "Performance" else
@@ -2933,7 +3149,8 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         {t: i for i, t in enumerate(unique_titles)}
     )
 
-    all_gaps = []
+    all_gaps    = []
+    used_titles = set()   # global dedup across all areas and gap types
 
     for area in titles_df["research_area"].unique():
         area_titles = titles_df[titles_df["research_area"] == area].copy()
@@ -3091,20 +3308,42 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
                     f"from your existing pages."
                 )
 
-            # ── Generate suggested title from the missing angle
+            # ── Generate suggested title from the cluster theme
+            # Use _extract_cluster_theme on rep_titles for a specific, shared phrase
+            # rather than the top-frequency-words fallback which produces generic titles.
+            cluster_theme = _extract_cluster_theme(rep_titles)
+
             if uncontested_paa:
-                # Title comes from the uncontested PAA question
-                best_q   = uncontested_paa[0].rstrip("?")
-                title_suggestion = (
-                    f"{best_q}"
-                )
+                # Title comes from the best uncontested PAA question
+                raw_title = uncontested_paa[0].rstrip("?").strip()
             else:
-                # Title comes from what's missing — deeper angle on the cluster theme
-                words = pattern.split(", ")
-                topic = " ".join(w.title() for w in words[:3]) if words else cluster_label
-                title_suggestion = (
-                    f"{topic}"
-                )
+                # Title comes from the cluster theme — a concrete shared phrase
+                raw_title = cluster_theme
+
+            # Dedup: if this exact title has already been used, try the next
+            # PAA question, then try theme + area qualifier, then skip
+            if raw_title in used_titles:
+                alternate = None
+                # Try remaining PAA questions first
+                for q in uncontested_paa[1:4]:
+                    candidate = q.rstrip("?").strip()
+                    if candidate not in used_titles and len(candidate) > 10:
+                        alternate = candidate
+                        break
+                if alternate is None and cluster_theme not in used_titles:
+                    alternate = cluster_theme
+                if alternate is None:
+                    # Last resort: theme + area qualifier
+                    short_area = area.split("/")[0].strip().split()[-1]
+                    candidate = f"{cluster_theme}: {short_area} Perspective"
+                    if candidate not in used_titles:
+                        alternate = candidate
+                if alternate is None:
+                    continue   # truly duplicate, skip this gap
+                raw_title = alternate
+
+            title_suggestion = raw_title
+            used_titles.add(title_suggestion)
 
             # What existing titles cover (shown in brief)
             existing_coverage = " · ".join(
@@ -3723,19 +3962,32 @@ def map_topic_clusters(df: pd.DataFrame, kw_emb: np.ndarray,
         a_emb        = kw_emb[area_indices]
 
         # ── Identify hub candidates
-        # Hubs are broad, high-volume keywords — they represent the pillar topic
-        # Proxy: shorter keyword (fewer words), higher impressions
+        # Hubs are broad, high-volume, informational keywords — pillar topic pages.
+        # Exclude transactional and navigational keywords (reagents, databases etc)
+        # which would otherwise score high on impressions but make terrible hubs.
         area_df["word_count_kw"] = area_df["keyword"].str.split().str.len()
 
+        # Only consider informational intent keywords as hub candidates
+        if "keyword_intent" in area_df.columns:
+            hub_candidates = area_df[
+                area_df["keyword_intent"].isin(["informational", "clinical"])
+            ].copy()
+        else:
+            hub_candidates = area_df.copy()
+
+        # Fallback: if filtering leaves nothing, use all
+        if len(hub_candidates) == 0:
+            hub_candidates = area_df.copy()
+
         # Hub score: fewer words + more impressions = broader pillar candidate
-        max_imp = area_df["impressions"].max() or 1
-        area_df["hub_score"] = (
-            (1 / area_df["word_count_kw"].clip(1, 10)) * 0.5 +
-            (area_df["impressions"] / max_imp)           * 0.5
+        max_imp = hub_candidates["impressions"].max() or 1
+        hub_candidates["hub_score"] = (
+            (1 / hub_candidates["word_count_kw"].clip(1, 10)) * 0.5 +
+            (hub_candidates["impressions"] / max_imp)           * 0.5
         )
 
-        n_hubs = max(1, min(5, len(area_df) // 10))
-        hub_mask   = area_df.nlargest(n_hubs, "hub_score")
+        n_hubs   = max(1, min(5, len(area_df) // 10))
+        hub_mask = hub_candidates.nlargest(n_hubs, "hub_score")
         spoke_mask = area_df[~area_df.index.isin(hub_mask.index)]
 
         hub_embs   = a_emb[[area_indices.index(i) for i in hub_mask.index]]
@@ -4151,6 +4403,7 @@ def main():
 
     recs.to_csv(recs_path)
     generate_report(df, recs, args.output,
+                    kw_emb=kw_emb,
                     briefs_html=briefs_html,
                     serp_gaps_html=serp_gaps_html,
                     visibility_html=visibility_html)
@@ -4173,12 +4426,12 @@ def main():
 
     print("\n📋  Top Research Area Recommendations:\n")
     show_cols = ["research_area", "keyword_count", "absence_gap_pct",
-                 "performance_gap_pct", "opportunity_score",
-                 "priority", "recommended_action"]
+                 "performance_gap_pct", "paa_coverage", "imp_weighted_gap",
+                 "opportunity_score", "priority", "recommended_action",
+                 "median_position", "pct_page2", "top3_imp_share", "aio_coverage_pct"]
     show_cols = [c for c in show_cols if c in recs.columns]
     print(recs[show_cols].to_string())
     print("═" * 62)
-    print(recs[show_cols].to_string())
 
 
 if __name__ == "__main__":
