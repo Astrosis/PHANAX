@@ -666,15 +666,27 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         print(f"      SERP sample: {list(serp['keyword'])[:3]}")
 
     # ── Merge — left join keeps all GSC keywords
-    # GSC metric columns (impressions, clicks, position, ctr) come from kw file.
-    # If serp file also has any of these columns they would create _x/_y suffixes
-    # or silently overwrite. Drop them from serp before merging to protect GSC values.
+    # Strategy: GSC metric columns (impressions, clicks, position, ctr) should always
+    # come from the keywords file (ground truth). But if the keywords file is missing
+    # those columns (e.g. a plain keyword list), keep them from SERP if present.
+    # Only drop SERP-side columns when the kw file ALREADY has real data for them.
     GSC_COLS = {"impressions", "clicks", "position", "ctr", "volume"}
-    serp_conflicts = [c for c in serp.columns if c in GSC_COLS]
+    serp_conflicts = []
+    for c in serp.columns:
+        if c not in GSC_COLS:
+            continue
+        # Only protect/drop from SERP if kw has genuinely non-default values
+        kw_has_real = c in kw.columns and (
+            pd.to_numeric(kw[c], errors="coerce").fillna(0) > 0
+        ).any()
+        if kw_has_real:
+            serp_conflicts.append(c)
+
     if serp_conflicts:
-        print(f"    → Dropping from SERP file (protected GSC columns): "
-              f"{serp_conflicts}")
+        print(f"    → Dropping from SERP file (kw file has these): {serp_conflicts}")
         serp = serp.drop(columns=serp_conflicts)
+    else:
+        print(f"    → Keeping all SERP columns (kw file has no overlapping metrics)")
 
     df = kw.merge(serp, on="keyword", how="left")
 
@@ -683,6 +695,14 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         if f"{col}_x" in df.columns:
             df[col] = df[f"{col}_x"]
             df = df.drop(columns=[f"{col}_x", f"{col}_y"], errors="ignore")
+
+    # Coerce GSC metric columns to numeric after merge — catches any stragglers
+    for col, default in [("impressions", 0), ("clicks", 0),
+                          ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+        else:
+            df[col] = default
 
     # ── Verify impressions survived the merge
     with_impressions_before = (kw["impressions"] > 0).sum()
@@ -872,6 +892,16 @@ def _clean_title(text: str):
     t = re.sub(r'\s+', ' ', t).strip()
 
     if not t or _CODE_RE.match(t) or len(t) < _MIN_SEGMENT_LEN:
+        return None
+
+    # Reject titles where a brand name appears as a full word —
+    # these are product/vendor pages, not useful content signals
+    t_lower = t.lower()
+    if any(
+        re.search(r'\b' + re.escape(term) + r'\b', t_lower)
+        for term in BRAND_TERMS
+        if len(term) > 4
+    ):
         return None
 
     return t
@@ -1153,61 +1183,143 @@ def _extract_cluster_theme(texts: list) -> str:
     Strategy:
     1. Find the longest n-gram (2-5 words) that appears in ≥2 of the texts
        AND contains at least one non-stopword — this is the shared theme.
-    2. If no recurring n-gram, return the shortest text (usually most generic/broad).
+    2. If no recurring n-gram, return the shortest text after stripping
+       stop-word-only phrases and brand tokens.
     3. Cap at 60 characters for display.
     """
     import itertools
 
     STOP = {
-        "a","an","the","and","or","of","in","to","for","on","with","is","are",
-        "was","were","be","been","as","at","by","from","that","this","which",
-        "it","its","their","our","your","we","they","he","she","you","i",
-        "how","what","why","when","where","who","not","no","can","could",
-        "may","might","will","would","should","have","has","had","do","does",
-        "did","into","than","then","about","after","before","between","other",
-        "new","more","most","also","only","both","all","any","each","some",
-        "these","those","such","but","if","so","yet","nor","via","vs","versus",
+        # Articles / determiners
+        "a","an","the","this","that","these","those","each","every","both","all",
+        "any","some","such","no","neither","either",
+        # Prepositions
+        "of","in","to","for","on","with","at","by","from","into","onto","upon",
+        "about","above","below","between","through","during","within","without",
+        "against","among","along","across","around","behind","beyond","beside",
+        "before","after","since","until","towards","toward","via","per","as",
+        # Conjunctions
+        "and","or","but","nor","so","yet","if","than","then","though","although",
+        "because","while","when","where","whereas","unless","whether",
+        # Pronouns
+        "it","its","their","our","your","we","they","he","she","you","i","them",
+        "him","her","us","who","which","what","whom","whose",
+        # Auxiliary verbs
+        "is","are","was","were","be","been","being","have","has","had","do","does",
+        "did","can","could","may","might","will","would","should","shall","must",
+        "need","ought","used",
+        # Question / relative words
+        "how","why","when","where","not","never","ever",
+        # Common filler adjectives / adverbs
+        "new","more","most","also","only","just","very","much","many","few",
+        "several","various","different","other","same","own","key","main",
+        "major","common","important","potential","current","recent","next",
+        "first","second","third","last","long","short","high","low","large",
+        "small","early","late","full","whole","certain","specific","general",
+        # Common connective phrases (single tokens after split)
+        "overview","introduction","review","update","guide","article","paper",
+        "study","research","analysis","report","data","results","findings",
+        "information","details","summary","notes","based","using","used",
+        "include","including","related","associated","compared","known",
+        "defined","called","named",
+        # Number words
+        "one","two","three","four","five","six","seven","eight","nine","ten",
+        # Punctuation-like tokens that slip through
+        "vs","versus","vs.",
     }
+
+    # Brand tokens — any n-gram containing these as a word is rejected
+    # (built from the first word of each BRAND_TERMS entry to avoid full-string matching)
+    _BRAND_TOKENS = {
+        w.lower()
+        for term in BRAND_TERMS
+        for w in term.split()
+        if len(w) > 2
+    } | {
+        # Common antibody/reagent brand fragments that wouldn't appear in BRAND_TERMS
+        "abcam","thermofisher","thermo","invitrogen","sigma","aldrich",
+        "biolegend","novus","scbt","santacruz","rndsystems","ptglab",
+        "cellsignal","biocompare","emdmillipore","millipore","qiagen",
+        "promega","neb","genscript","origene","peprotech","cayman","tocris",
+        "rockland","bethyl","epitomics","abnova","bioss","lsbio","gentex",
+    }
+
+    def _is_brand_free(ng: str) -> bool:
+        """Return False if any token in the n-gram is a brand token."""
+        return not any(w in _BRAND_TOKENS for w in ng.split())
+
+    def _clean_for_display(text: str) -> str:
+        """
+        Strip leading/trailing stop words from a title so the fallback
+        label doesn't start with 'What Is' or 'How To'.
+        """
+        words = text.split()
+        # Strip leading stop words
+        while words and words[0].lower() in STOP:
+            words = words[1:]
+        # Strip trailing stop words
+        while words and words[-1].lower() in STOP:
+            words = words[:-1]
+        # Strip leading brand tokens
+        while words and words[0].lower() in _BRAND_TOKENS:
+            words = words[1:]
+        return " ".join(words)
 
     texts = [str(t).strip() for t in texts if t and len(str(t).strip()) > 5]
     if not texts:
         return "Unknown cluster"
 
-    # Normalise: lowercase, collapse spaces
-    normed = [re.sub(r"\s+", " ", t.lower()) for t in texts]
+    # Normalise: lowercase, collapse spaces, normalise hyphens to spaces
+    # so "car-t" and "car t" count as the same token for n-gram matching
+    normed = [re.sub(r"\s+", " ", t.lower().replace("-", " ")) for t in texts]
 
     # Extract n-grams (2-5 words) from each text
+    # Pattern allows hyphenated bio terms: pd-1, car-t, il-6, kras-g12c
     def ngrams(text, n):
-        words = re.findall(r"\b[a-z][a-z\-]{1,}\b", text)
+        words = re.findall(r"\b[a-z][a-z0-9\-]*[a-z0-9]\b|\b[a-z]{2,}\b", text)
+        words = [w for w in words if len(w) >= 2]
         return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
 
-    # Count n-gram frequency across all texts
-    ngram_counts = Counter()
+    # Count n-gram frequency across all texts — track both raw count and
+    # distinct-text count (how many different texts contain this n-gram)
+    ngram_counts    = Counter()   # total occurrences
+    ngram_texts     = Counter()   # distinct texts containing n-gram
     for text in normed:
         seen = set()
         for n in range(5, 1, -1):
             for ng in ngrams(text, n):
                 if ng not in seen:
-                    ngram_counts[ng] += 1
+                    ngram_texts[ng]  += 1
                     seen.add(ng)
+                ngram_counts[ng] += 1
 
-    # Filter: must appear in ≥2 texts, must have ≥1 non-stopword,
-    # prefer longer n-grams
+    # Filter: must appear in ≥2 distinct texts, must have ≥1 non-stopword,
+    # must not start/end with a stop word, must not contain brand tokens
     candidates = [
-        (ng, cnt) for ng, cnt in ngram_counts.items()
-        if cnt >= 2
+        (ng, ngram_texts[ng]) for ng in ngram_texts
+        if ngram_texts[ng] >= 2
         and any(w not in STOP for w in ng.split())
         and not all(w in STOP for w in ng.split())
+        and ng.split()[0]  not in STOP    # don't start with stop word
+        and ng.split()[-1] not in STOP    # don't end with stop word
+        and _is_brand_free(ng)            # no brand tokens
     ]
 
     if candidates:
-        # Sort by (count desc, length desc) — most shared + most specific
-        best = sorted(candidates, key=lambda x: (x[1], len(x[0])), reverse=True)
-        label = best[0][0].title()
+        # Primary: distinct-text count (how many titles share this phrase)
+        # Secondary: n-gram length (more specific = better)
+        best  = sorted(candidates, key=lambda x: (x[1], len(x[0])), reverse=True)
+        label = _clean_for_display(best[0][0]).title()
+        if not label:
+            label = best[0][0].title()
         return label[:60] + "..." if len(label) > 60 else label
 
-    # Fallback: shortest text (tends to be the broadest/most general)
+    # Fallback: clean the shortest text before returning
     fallback = min(texts, key=len)
+    fallback = _clean_for_display(fallback)
+    if not fallback:
+        # Everything was stop words — just return the raw shortest
+        fallback = min(texts, key=len)
     return fallback[:60] + "..." if len(fallback) > 60 else fallback
 
 
@@ -4285,7 +4397,17 @@ def main():
     )
 
     # ── Save outputs
-    drop_cols               = ["enriched_text"]
+    # Drop internal/noise columns from clusters.csv:
+    # - enriched_text: large embedding input text, not useful post-pipeline
+    # - gap_absence/performance/format/snippet: binary flags replaced by
+    #   primary_gap + gap_score; keeping them just creates confusion
+    # - academic_lock/serp_diversity: noisy intermediate metrics
+    # - winnability: replaced by paa_coverage in opportunity scoring
+    drop_cols = [
+        "enriched_text",
+        "gap_absence", "gap_performance", "gap_format", "gap_snippet",
+        "academic_lock", "serp_diversity", "winnability",
+    ]
     clusters_path           = os.path.join(args.output, "clusters.csv")
     gaps_path               = os.path.join(args.output, "gaps.csv")
     recs_path               = os.path.join(args.output, "recommendations.csv")
@@ -4374,10 +4496,9 @@ def main():
                 "aio_cluster_ids", "aio_cluster_labels",
                 "cluster_label",
                 "primary_gap", "gap_score",
-                "gap_absence", "gap_performance",
-                "gap_format", "gap_paa", "gap_snippet", "paa_questions",
+                "gap_paa", "paa_questions",
                 "impressions", "clicks", "position", "ctr",
-                "dominant_format", "serp_diversity"]
+                "dominant_format"]
     gap_cols = [c for c in gap_cols if c in df.columns]
     (
         df[(df["primary_gap"] != "None") & (df["gap_score"] >= 0.15)][gap_cols]
