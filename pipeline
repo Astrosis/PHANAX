@@ -2881,7 +2881,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         print(f"  {rank:>2}. {tier_tag} [{row['research_area']}]")
         print(f"       {row['suggested_title']}")
         print(f"       {row['content_type']} · {row['recommended_action']} · "
-              f"{row['keyword_count']} keywords · {row['word_count']} words")
+              f"{row['keyword_count']} keywords")
         if row["paa_count"] > 0:
             first_q = str(row["paa_questions"]).split("|")[0].strip()
             print(f"       PAA ({row['paa_count']} Qs): {first_q}...")
@@ -2903,10 +2903,6 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
             if row["tier"] == 1 else
             "<span style='background:#6c757d;color:white;border-radius:4px;"
             "padding:2px 8px;font-size:0.75em;margin-right:6px'>Tier 2</span>"
-        )
-        cross_html = (
-            f"<span style='font-size:0.8em;color:#6c757d'> · Also: {row['cross_area']}</span>"
-            if row.get("cross_area") else ""
         )
 
         # PAA questions as structured list
@@ -2958,14 +2954,6 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
             "Snippet":     "#198754",
         }.get(row["primary_gap"], "#6c757d")
 
-        snippet_html = (
-            "<div style='margin-top:10px;font-size:0.8em;background:#fff3cd;"
-            "border-radius:4px;padding:6px 10px'>"
-            "⭐ Featured snippet opportunity — aim for a direct answer in the opening paragraph"
-            "</div>"
-            if row.get("has_snippet_opp") else ""
-        )
-
         cards += f"""
         <div style='background:white;border-radius:12px;padding:22px 26px;
                     box-shadow:0 2px 10px rgba(0,0,0,.08);margin-bottom:24px;
@@ -2976,15 +2964,13 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
             <div>
               {tier_badge}
               <span style='font-size:0.83em;color:#495057;font-weight:600'>
-                {row['research_area']}</span>{cross_html}
+                {row['research_area']}</span>
             </div>
             <div style='display:flex;gap:6px;flex-wrap:wrap'>
               <span style='background:{gap_colour};color:white;border-radius:4px;
                            padding:2px 9px;font-size:0.78em'>{row['primary_gap']} Gap</span>
               <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
                            padding:2px 9px;font-size:0.78em'>{row['content_type']}</span>
-              <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
-                           padding:2px 9px;font-size:0.78em'>{row['word_count']} words</span>
               <span style='background:#f8f9fa;border:1px solid #dee2e6;border-radius:4px;
                            padding:2px 9px;font-size:0.78em'>{row['recommended_action']}</span>
             </div>
@@ -2996,8 +2982,7 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
           </h3>
 
           <div style='font-size:0.82em;color:#6c757d;margin-bottom:14px'>
-            {row['keyword_count']} target keywords &nbsp;·&nbsp;
-            Tone: {row['tone']}
+            {row['keyword_count']} target keywords
           </div>
 
           <div>
@@ -3007,7 +2992,6 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
 
           {structure_html}
           {paa_html}
-          {snippet_html}
         </div>"""
 
     return f"""
