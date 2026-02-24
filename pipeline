@@ -656,7 +656,7 @@ def embed_all(df: pd.DataFrame):
     )
 
     print(f"    → Keyword embeddings: {kw_emb.shape} | Area embeddings: {area_emb.shape}")
-    return kw_emb, area_emb
+    return kw_emb, area_emb, model   # return model so downstream stages reuse it
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -704,7 +704,7 @@ def map_research_areas(df: pd.DataFrame, kw_emb: np.ndarray,
 # ═══════════════════════════════════════════════════════════════════════
 
 def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
-                     min_cluster: int) -> pd.DataFrame:
+                     min_cluster: int, model) -> pd.DataFrame:
     """
     Title-first clustering — fundamentally different from keyword clustering.
 
@@ -1939,20 +1939,46 @@ def _recommend_structure(paa_questions: list[str], content_type: str,
     return " → ".join(sections)
 
 
-def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
-                             recs: pd.DataFrame, output_dir: str,
-                             n_briefs: int = 12) -> pd.DataFrame:
+def _cluster_relevance_score(text: str, area_emb: np.ndarray, model) -> float:
     """
-    Stage 9: Generate 10-15 prioritised, specific content briefs.
+    Score how relevant a text (cluster label, title, or PAA question) is
+    to any of the life science research areas.
+    Returns max cosine similarity to any area embedding — 0.0 to 1.0.
+    Anything below ~0.20 is unlikely to be life science content.
+    """
+    emb = model.encode(text, normalize_embeddings=True)
+    sims = emb @ area_emb.T
+    return float(sims.max())
 
-    Key improvements over v1:
-    - Cluster labels use quality-filtered keyword selection (no product IDs)
-    - Titles are generated with 6 strategies + deduplication tracker
-    - Each brief includes a suggested article structure (H2 sections)
-    - Topic phrase extraction prefers specific multi-word biology terms
-    - Per-area clustering keeps briefs cleanly scoped
+
+# Minimum cosine similarity to research area taxonomy for a cluster
+# or PAA question to be included in briefs / gaps
+RELEVANCE_THRESHOLD = 0.22
+
+
+def _is_relevant(text: str, area_emb: np.ndarray, model,
+                 threshold: float = RELEVANCE_THRESHOLD) -> bool:
+    """Return True if text is semantically relevant to life science."""
+    if not text or len(text.strip()) < 8:
+        return False
+    return _cluster_relevance_score(text, area_emb, model) >= threshold
+
+
+def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
+                             area_emb: np.ndarray, model,
+                             recs: pd.DataFrame, output_dir: str,
+                             n_briefs: int = 25) -> pd.DataFrame:
     """
-    print("\n[9/9] Generating content briefs...")
+    Stage 9: Generate prioritised, specific content briefs.
+
+    Relevance gating:
+    - Every cluster topic is scored against the research area taxonomy
+    - Clusters below RELEVANCE_THRESHOLD are dropped entirely
+    - PAA questions are individually filtered the same way
+    - This eliminates junk like "Is ELISA a girl's name" or
+      unrelated religious/cultural content that bleeds into SERP data
+    """
+    print("\n[9] Generating content briefs...")
 
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import AgglomerativeClustering, KMeans
@@ -1962,7 +1988,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
     work = df[
         (df["research_area"] != "Unclassified / General Methods") &
         (df["gap_score"] >= 0.15) &
-        (df["keyword"].apply(_is_valid_label))   # filter product IDs at source
+        (df["keyword"].apply(_is_valid_label))
     ].copy()
 
     if len(work) == 0:
@@ -1971,7 +1997,8 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
 
     tier_lookup  = {a["name"]: a.get("tier", 2) for a in RESEARCH_AREAS}
     all_briefs   = []
-    used_titles  = set()   # deduplication across all briefs
+    used_titles  = set()
+    rejected     = 0
 
     areas_ordered = (
         recs.sort_values(["tier", "opportunity_score"], ascending=[True, False])
@@ -2022,17 +2049,23 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             valid_kws = [k for k in cluster["keyword"].tolist() if _is_valid_label(k)]
             topic     = _extract_topic_phrase(valid_kws)
 
+            # ── Relevance gate — reject clusters not related to life science
+            if not _is_relevant(topic, area_emb, model):
+                rejected += 1
+                continue
+
             # ── Gap signals
             avg_gap   = cluster["gap_score"].mean()
             top_gap   = cluster["primary_gap"].value_counts().index[0] \
                         if len(cluster["primary_gap"].value_counts()) else "Absence"
 
-            # ── PAA questions — deduplicated, quality-filtered
+            # ── PAA questions — deduplicated, quality-filtered, relevance-gated
             all_paa = []
             for paa_str in cluster["paa_questions"].dropna():
                 for q in str(paa_str).split("|"):
                     q = q.strip()
-                    if q and len(q) > 10 and q not in all_paa:
+                    if (q and len(q) > 10 and q not in all_paa
+                            and _is_relevant(q, area_emb, model)):
                         all_paa.append(q)
 
             # ── Format and tone
@@ -2107,6 +2140,8 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
     if not all_briefs:
         print("    → No briefs generated — check gap threshold or keyword quality")
         return pd.DataFrame()
+
+    print(f"    → {rejected} clusters rejected (below relevance threshold)")
 
     briefs_df = pd.DataFrame(all_briefs)
 
@@ -2295,7 +2330,8 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
-                          model, n_gaps: int = 12) -> tuple:
+                          model, area_emb: np.ndarray,
+                          n_gaps: int = 25) -> tuple:
     """
     Stage 10: Data-mine SERP titles to find content angles that are either:
       A) Heavily represented in top-ranking titles but you have no presence
@@ -2357,15 +2393,16 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         paas    = [q.strip() for q in paa_str.split("|") if q.strip() and len(q.strip()) > 8]
 
         for title in titles:
-            if title and len(title) > 10 and title.lower() != keyword:
+            if (title and len(title) > 10 and title.lower() != keyword
+                    and _is_relevant(title, area_emb, model)):
                 title_rows.append({
-                    "title":       title,
-                    "keyword":     keyword,
+                    "title":         title,
+                    "keyword":       keyword,
                     "research_area": area,
-                    "position":    position,
-                    "impressions": impressions,
+                    "position":      position,
+                    "impressions":   impressions,
                     "paa_questions": paa_str,
-                    "paas":        paas,
+                    "paas":          paas,
                 })
 
     if not title_rows:
@@ -2414,11 +2451,12 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         area_titles = area_titles.copy()
         area_titles["title_cluster"] = labels
 
-        # ── Collect all PAA questions for this area (deduplicated)
+        # ── Collect PAA questions — deduplicated and relevance-gated
         all_area_paa = []
         for paa_list in area_titles["paas"].tolist():
             for q in paa_list:
-                if q and q not in all_area_paa:
+                if (q and q not in all_area_paa
+                        and _is_relevant(q, area_emb, model)):
                     all_area_paa.append(q)
 
         # Embed PAA questions if we have them
@@ -2458,8 +2496,12 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
                              if w not in noise]
                 return ", ".join(top_words[:5]) if top_words else "mixed"
 
-            pattern     = extract_pattern(rep_titles)
+            pattern       = extract_pattern(rep_titles)
             cluster_label = rep_titles[0] if rep_titles else f"Cluster {cid}"
+
+            # ── Relevance gate — reject clusters not related to life science
+            if not _is_relevant(cluster_label, area_emb, model):
+                continue
 
             # ── Your presence: avg position for keywords mapping to this cluster
             # Keywords "map" to this cluster if their position is tracked
@@ -3437,13 +3479,13 @@ def main():
     df = enrich_text(df)
 
     # ── Stage 3: Embed
-    kw_emb, area_emb = embed_all(df)
+    kw_emb, area_emb, model = embed_all(df)
 
     # ── Stage 4: Research area mapping
     df = map_research_areas(df, kw_emb, area_emb, args.threshold)
 
     # ── Stage 5: Title-first clustering + AIO clustering
-    df, titles_df = cluster_keywords(df, kw_emb, args.min_cluster)
+    df, titles_df = cluster_keywords(df, kw_emb, args.min_cluster, model)
 
     # ── Stage 6: Competitor landscape
     df = analyze_competitor_landscape(df)
@@ -3454,15 +3496,15 @@ def main():
     # ── Stage 8: Score & recommend
     area_df, recs = score_and_recommend(df, args.top_n)
 
-    # ── Stage 9: Content briefs (per-area clustering)
-    briefs_df   = generate_content_briefs(df, kw_emb, recs, args.output, n_briefs=12)
+    # ── Stage 9: Content briefs (per-area clustering, relevance-gated)
+    briefs_df   = generate_content_briefs(
+        df, kw_emb, area_emb, model, recs, args.output, n_briefs=25
+    )
     briefs_html = generate_briefs_html(briefs_df, args.output)
 
-    # ── Stage 10: SERP title mining — content angle gaps
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    # ── Stage 10: SERP title mining — content angle gaps (relevance-gated)
     serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
-        df, args.output, model, n_gaps=12
+        df, args.output, model, area_emb, n_gaps=25
     )
 
     # ── Stage 11: Search intent classification
@@ -3496,8 +3538,71 @@ def main():
     fresh_path              = os.path.join(args.output, "freshness_priority.csv")
     tc_path                 = os.path.join(args.output, "topic_clusters.csv")
     title_cluster_map_path  = os.path.join(args.output, "title_cluster_map.csv")
+    title_kw_map_path       = os.path.join(args.output, "keyword_map_title_clusters.csv")
+    aio_kw_map_path         = os.path.join(args.output, "keyword_map_aio_clusters.csv")
 
-    # Save title-level cluster mapping
+    # ── Keyword map 1: Title clusters
+    # One row per keyword. Shows every title cluster the keyword belongs to,
+    # ordered by title position (primary = highest-ranked title's cluster).
+    # Useful for: understanding what topics Google associates with each keyword,
+    # mapping keywords to content briefs, identifying multi-topic keywords.
+    title_kw_map = df[[
+        "keyword", "research_area", "impressions", "position",
+        "primary_cluster_id", "primary_cluster_label",
+        "cluster_ids", "cluster_labels",
+    ]].copy()
+    title_kw_map.columns = [
+        "keyword", "research_area", "impressions", "position",
+        "primary_title_cluster_id", "primary_title_cluster_label",
+        "all_title_cluster_ids", "all_title_cluster_labels",
+    ]
+    title_kw_map["cluster_count"] = (
+        title_kw_map["all_title_cluster_ids"]
+        .str.count(r"\|\|")
+        .add(1)
+        .where(title_kw_map["all_title_cluster_ids"].str.strip() != "", 0)
+    )
+    title_kw_map = title_kw_map.sort_values(
+        ["research_area", "impressions"], ascending=[True, False]
+    )
+    title_kw_map.to_csv(title_kw_map_path, index=False)
+    print(f"    → keyword_map_title_clusters.csv: {len(title_kw_map):,} keywords")
+
+    # ── Keyword map 2: AIO clusters
+    # Only keywords that have AI Overview data.
+    # One row per keyword. Shows primary AIO cluster and all AIO clusters
+    # if the keyword's snippets span multiple themes.
+    # Useful for: understanding what Google synthesises for each topic,
+    # identifying where AI Overviews are displacing organic clicks,
+    # finding AIO-specific content angles.
+    aio_cols_present = [c for c in [
+        "keyword", "research_area", "impressions", "position",
+        "aio_cluster_id", "aio_cluster_label",
+        "aio_cluster_ids", "aio_cluster_labels",
+    ] if c in df.columns]
+
+    if len(aio_cols_present) > 4:   # has AIO columns
+        aio_kw_map = df[aio_cols_present].copy()
+        aio_kw_map = aio_kw_map[
+            aio_kw_map.get("aio_cluster_id", pd.Series(-1, index=aio_kw_map.index)) >= 0
+        ]
+        if len(aio_kw_map) > 0:
+            aio_kw_map["aio_cluster_count"] = (
+                aio_kw_map.get("aio_cluster_ids", pd.Series("", index=aio_kw_map.index))
+                .str.count(r"\|\|")
+                .add(1)
+            )
+            aio_kw_map = aio_kw_map.sort_values(
+                ["research_area", "impressions"], ascending=[True, False]
+            )
+            aio_kw_map.to_csv(aio_kw_map_path, index=False)
+            print(f"    → keyword_map_aio_clusters.csv: {len(aio_kw_map):,} keywords with AIO data")
+        else:
+            print("    → keyword_map_aio_clusters.csv: no AIO data present")
+    else:
+        print("    → keyword_map_aio_clusters.csv: skipped (no AIO columns)")
+
+    # ── Save title-level cluster mapping (full detail: one row per title)
     if titles_df is not None and len(titles_df) > 0:
         titles_df[["title", "keyword", "cluster_id", "cluster_label"]].to_csv(
             title_cluster_map_path, index=False
@@ -3510,7 +3615,7 @@ def main():
                 "cluster_ids", "cluster_labels",
                 "aio_cluster_id", "aio_cluster_label",
                 "aio_cluster_ids", "aio_cluster_labels",
-                "cluster_label",   # backward compat
+                "cluster_label",
                 "primary_gap", "gap_score",
                 "gap_absence", "gap_performance",
                 "gap_format", "gap_paa", "gap_snippet", "paa_questions",
@@ -3531,16 +3636,18 @@ def main():
 
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
-    print(f"   clusters.csv            → {clusters_path}")
-    print(f"   title_cluster_map.csv   → {title_cluster_map_path}")
-    print(f"   gaps.csv                → {gaps_path}")
-    print(f"   recommendations.csv     → {recs_path}")
-    print(f"   content_briefs.csv      → {briefs_path}")
-    print(f"   serp_content_gaps.csv   → {serp_gaps_path}")
-    print(f"   page2_fast_wins.csv     → {wins_path}")
-    print(f"   freshness_priority.csv  → {fresh_path}")
-    print(f"   topic_clusters.csv      → {tc_path}")
-    print(f"   report.html             → {os.path.join(args.output, 'report.html')}")
+    print(f"   clusters.csv                    → {clusters_path}")
+    print(f"   title_cluster_map.csv           → {title_cluster_map_path}")
+    print(f"   keyword_map_title_clusters.csv  → {title_kw_map_path}")
+    print(f"   keyword_map_aio_clusters.csv    → {aio_kw_map_path}")
+    print(f"   gaps.csv                        → {gaps_path}")
+    print(f"   recommendations.csv             → {recs_path}")
+    print(f"   content_briefs.csv              → {briefs_path}")
+    print(f"   serp_content_gaps.csv           → {serp_gaps_path}")
+    print(f"   page2_fast_wins.csv             → {wins_path}")
+    print(f"   freshness_priority.csv          → {fresh_path}")
+    print(f"   topic_clusters.csv              → {tc_path}")
+    print(f"   report.html                     → {os.path.join(args.output, 'report.html')}")
     print("═" * 62)
 
     print("\n📋  Top Research Area Recommendations:\n")
@@ -3550,12 +3657,6 @@ def main():
     show_cols = [c for c in show_cols if c in recs.columns]
     print(recs[show_cols].to_string())
     print("═" * 62)
-
-    print("\n📋  Top Research Area Recommendations:\n")
-    show_cols = ["research_area", "keyword_count", "absence_gap_pct",
-                 "performance_gap_pct", "opportunity_score",
-                 "priority", "recommended_action"]
-    show_cols = [c for c in show_cols if c in recs.columns]
     print(recs[show_cols].to_string())
 
 
