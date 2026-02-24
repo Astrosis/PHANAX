@@ -40,9 +40,102 @@ import pandas as pd
 warnings.filterwarnings("ignore")
 
 
+_EMB_CACHE_DIR: str = "/tmp"   # overridden in main() to args.output
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# RESEARCH AREA TAXONOMY
-# ═══════════════════════════════════════════════════════════════════════
+#
+# Caches embeddings to disk keyed by a hash of the input texts.
+# On re-run the embed step is skipped entirely — loads from .npy in ~1s
+# instead of encoding for 20-40 minutes.
+#
+# Cache location: <output_dir>/.emb_cache/
+# Each cache entry is two files:
+#   <hash>.npy   — the embedding matrix
+#   <hash>.json  — metadata (text count, model name, timestamp)
+#
+# Cache is invalidated automatically if the input texts change
+# (different keywords, updated SERP data etc.) — the hash won't match.
+# ─────────────────────────────────────────────────────────────────────
+
+import hashlib
+import json
+from pathlib import Path
+
+
+def _emb_cache_key(texts: list, model_name: str) -> str:
+    """SHA-256 of sorted text list + model name → stable cache key."""
+    h = hashlib.sha256()
+    h.update(model_name.encode())
+    for t in texts:
+        h.update(str(t).encode())
+    return h.hexdigest()[:16]   # 16 hex chars is plenty for uniqueness
+
+
+def _cache_path(cache_dir: Path, key: str):
+    return cache_dir / f"{key}.npy", cache_dir / f"{key}.json"
+
+
+def cached_encode(texts: list, model, cache_dir: str,
+                  label: str = "texts",
+                  batch_size: int = 256,
+                  show_progress_bar: bool = True) -> np.ndarray:
+    """
+    Encode texts with the sentence transformer model, caching to disk.
+
+    First call: encodes and saves to cache_dir/.emb_cache/<hash>.npy
+    Subsequent calls with same texts: loads from cache, skips encoding entirely.
+
+    Args:
+        texts:             list of strings to encode
+        model:             SentenceTransformer instance
+        cache_dir:         output directory (cache stored in subdir)
+        label:             human-readable name for progress messages
+        batch_size:        encoding batch size (256 is safe on most hardware)
+        show_progress_bar: show tqdm bar during encoding
+    """
+    cache_root = Path(cache_dir) / ".emb_cache"
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    model_name = getattr(model, "_model_card_data", {}).get("model_name", "unknown") \
+                 if hasattr(model, "_model_card_data") else "all-MiniLM-L6-v2"
+
+    key       = _emb_cache_key(texts, model_name)
+    npy_path, meta_path = _cache_path(cache_root, key)
+
+    if npy_path.exists() and meta_path.exists():
+        embs = np.load(str(npy_path))
+        with open(meta_path) as f:
+            meta = json.load(f)
+        print(f"    → [{label}] Loaded {embs.shape[0]:,} embeddings from cache "
+              f"(saved {meta.get('saved_at', '?')})")
+        return embs
+
+    print(f"    → [{label}] Encoding {len(texts):,} texts "
+          f"(batch_size={batch_size})...")
+    embs = model.encode(
+        texts,
+        show_progress_bar=show_progress_bar,
+        batch_size=batch_size,
+        normalize_embeddings=True,
+    )
+
+    np.save(str(npy_path), embs)
+    with open(meta_path, "w") as f:
+        json.dump({
+            "label":      label,
+            "n_texts":    len(texts),
+            "model":      model_name,
+            "shape":      list(embs.shape),
+            "saved_at":   pd.Timestamp.now().isoformat(),
+        }, f, indent=2)
+
+    print(f"    → [{label}] Cached {embs.shape[0]:,} embeddings → "
+          f"{npy_path.name}")
+    return embs
+
+
+
 
 RESEARCH_AREAS = [
 
@@ -631,7 +724,7 @@ def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
 # 3. EMBED
 # ═══════════════════════════════════════════════════════════════════════
 
-def embed_all(df: pd.DataFrame):
+def embed_all(df: pd.DataFrame, cache_dir: str):
     print("\n[3/8] Generating embeddings...")
     try:
         from sentence_transformers import SentenceTransformer
@@ -640,23 +733,19 @@ def embed_all(df: pd.DataFrame):
 
     model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    print("      Embedding enriched keyword texts...")
-    kw_emb = model.encode(
-        df["enriched_text"].tolist(),
-        show_progress_bar=True,
-        batch_size=64,
-        normalize_embeddings=True
+    kw_emb = cached_encode(
+        df["enriched_text"].tolist(), model, cache_dir,
+        label="keyword enriched texts", batch_size=256,
     )
 
-    print("      Embedding research area taxonomy...")
-    area_emb = model.encode(
-        [a["description"] for a in RESEARCH_AREAS],
+    area_emb = cached_encode(
+        [a["description"] for a in RESEARCH_AREAS], model, cache_dir,
+        label="research area taxonomy", batch_size=256,
         show_progress_bar=False,
-        normalize_embeddings=True
     )
 
     print(f"    → Keyword embeddings: {kw_emb.shape} | Area embeddings: {area_emb.shape}")
-    return kw_emb, area_emb, model   # return model so downstream stages reuse it
+    return kw_emb, area_emb, model
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -805,12 +894,10 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
 
     # Step 2: Embed unique titles (deduplicate to save compute)
     unique_titles = titles_df["title"].drop_duplicates().tolist()
-    print(f"    → Embedding {len(unique_titles):,} unique titles...")
-    title_embs = model.encode(
-        unique_titles,
-        show_progress_bar=True,
-        batch_size=128,
-        normalize_embeddings=True,
+    title_embs = cached_encode(
+        unique_titles, model, _EMB_CACHE_DIR,
+        label=f"cluster titles ({len(unique_titles):,} unique)",
+        batch_size=256,
     )
     title_emb_map = {t: e for t, e in zip(unique_titles, title_embs)}
 
@@ -1009,11 +1096,11 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
 
             # Embed unique snippets
             unique_snips = aio_df["snippet"].drop_duplicates().tolist()
-            aio_embs_raw = model.encode(
-                unique_snips,
+            aio_embs_raw = cached_encode(
+                unique_snips, model, _EMB_CACHE_DIR,
+                label=f"AIO snippets ({len(unique_snips):,} unique)",
+                batch_size=256,
                 show_progress_bar=False,
-                batch_size=128,
-                normalize_embeddings=True,
             )
             snip_emb_map = {s: e for s, e in zip(unique_snips, aio_embs_raw)}
             all_aio_embs = np.array([snip_emb_map[s] for s in aio_df["snippet"]])
@@ -1451,7 +1538,7 @@ def score_and_recommend(df: pd.DataFrame, top_n: int) -> tuple:
     # ── Recommended action
     def action(row):
         if row["absence_gap_pct"] >= 60:
-            return "🆕 Create"
+            return "Create"
         if row["performance_gap_pct"] >= 40:
             return "🔧 Optimise"
         return "🆕+🔧 Create & Optimise"
@@ -1679,8 +1766,8 @@ CONTENT_TYPE_MAP = {
     "listicle":   "Curated Explainer",
     "comparison": "Comparative Analysis",
     "news":       "Research Spotlight",
-    "other":      "Research Overview",
-    "unknown":    "Research Overview",
+    "other":      "Research Article",
+    "unknown":    "Research Article",
 }
 
 # Keywords that should never be used as a cluster label
@@ -1799,7 +1886,7 @@ def _generate_title(topic: str, paa_questions: list[str], primary_gap: str,
         for q in (specific_qs + generic_qs)[:5]:
             q_clean = q.strip().rstrip("?")
             if len(q_clean) > 20:
-                candidate = f"{q_clean}: Current Evidence and Research Directions"
+                candidate = f"{q_clean}"
                 if candidate not in used_titles:
                     used_titles.add(candidate)
                     return candidate
@@ -1864,7 +1951,7 @@ def _generate_title(topic: str, paa_questions: list[str], primary_gap: str,
                 return t
 
     # ── Fallback with uniqueness guarantee
-    fallback = f"{topic_title}: Research Overview, Methods and Key Findings"
+    fallback = f"{topic_title}"
     suffix   = 2
     base     = fallback
     while fallback in used_titles:
@@ -2072,7 +2159,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             fmt_counts = cluster["dominant_format"].value_counts()
             dom_fmt    = fmt_counts.index[0] if len(fmt_counts) else "other"
             avg_lock   = cluster["academic_lock"].mean()
-            content_type = CONTENT_TYPE_MAP.get(dom_fmt, "Research Overview")
+            content_type = CONTENT_TYPE_MAP.get(dom_fmt, "Research Article")
 
             # ── Target keywords: valid only, sorted by impressions
             if "impressions" in cluster.columns and cluster["impressions"].sum() > 0:
@@ -2129,7 +2216,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
                 "avg_gap_score":       round(avg_gap, 3),
                 "has_snippet_opp":     has_snippet,
                 "recommended_action":  (
-                    "🆕 Create"          if top_gap == "Absence"     else
+                    "Create"              if top_gap == "Absence"     else
                     "🔧 Optimise"        if top_gap == "Performance" else
                     "❓ Add PAA content" if top_gap == "PAA"         else
                     "📋 Reformat"        if top_gap == "Format"      else
@@ -2414,13 +2501,11 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
           f"{titles_df['research_area'].nunique()} research areas")
 
     # ── Embed the title corpus
-    print("    → Embedding SERP title corpus...")
     unique_titles = titles_df["title"].drop_duplicates().tolist()
-    title_embs    = model.encode(
-        unique_titles,
-        show_progress_bar=False,
-        batch_size=128,
-        normalize_embeddings=True
+    title_embs    = cached_encode(
+        unique_titles, model, _EMB_CACHE_DIR,
+        label=f"SERP titles ({len(unique_titles):,} unique)",
+        batch_size=256,
     )
     title_emb_map = {t: e for t, e in zip(unique_titles, title_embs)}
     titles_df["emb_idx"] = titles_df["title"].map(
@@ -2581,15 +2666,14 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
                 # Title comes from the uncontested PAA question
                 best_q   = uncontested_paa[0].rstrip("?")
                 title_suggestion = (
-                    f"{best_q}: Evidence, Mechanisms and Research Implications"
+                    f"{best_q}"
                 )
             else:
                 # Title comes from what's missing — deeper angle on the cluster theme
                 words = pattern.split(", ")
                 topic = " ".join(w.title() for w in words[:3]) if words else cluster_label
                 title_suggestion = (
-                    f"{topic}: A Deep-Dive into Mechanisms, Current Evidence "
-                    f"and Research Directions"
+                    f"{topic}"
                 )
 
             # What existing titles cover (shown in brief)
@@ -3472,6 +3556,10 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
+    # ── Embedding cache directory (shared across all stages)
+    global _EMB_CACHE_DIR
+    _EMB_CACHE_DIR = args.output
+
     # ── Stage 1: Load & merge
     df = load_and_merge(args.keywords, args.serp, args.kw_col)
 
@@ -3479,7 +3567,7 @@ def main():
     df = enrich_text(df)
 
     # ── Stage 3: Embed
-    kw_emb, area_emb, model = embed_all(df)
+    kw_emb, area_emb, model = embed_all(df, args.output)
 
     # ── Stage 4: Research area mapping
     df = map_research_areas(df, kw_emb, area_emb, args.threshold)
