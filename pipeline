@@ -699,66 +699,403 @@ def map_research_areas(df: pd.DataFrame, kw_emb: np.ndarray,
 # 5. SUB-TOPIC CLUSTERING
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════
+# 5. TITLE-FIRST CLUSTERING + AI OVERVIEW CLUSTERING
+# ═══════════════════════════════════════════════════════════════════════
+
 def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
                      min_cluster: int) -> pd.DataFrame:
-    print("\n[5/8] Sub-topic clustering...")
+    """
+    Title-first clustering — fundamentally different from keyword clustering.
+
+    OLD approach: embed keyword → cluster keywords → one cluster per keyword
+    NEW approach: embed each organic title → cluster titles → map clusters
+                  back to keywords. One keyword can belong to multiple clusters
+                  if its titles span multiple themes.
+
+    Why this is better:
+      "KRAS G12C inhibitor" as a keyword is ambiguous — is it about mechanism,
+      clinical trials, or resistance? Its titles tell you: title_1 might be about
+      mechanism (→ cluster A), title_2 about a trial (→ cluster B), title_3 about
+      resistance (→ cluster C). The keyword now has three cluster memberships,
+      each representing a distinct content opportunity.
+
+    Output columns added to df:
+      title_cluster_ids     — comma-separated cluster IDs for all titles of this keyword
+      title_cluster_labels  — comma-separated cluster labels (most rep. title per cluster)
+      primary_cluster_id    — cluster of the keyword's most representative title (for t-SNE)
+      primary_cluster_label — label of primary cluster
+      aio_cluster_id        — AI Overview reference snippet cluster (if data available)
+      aio_cluster_label     — label of AI Overview cluster
+
+    Also produces a separate title_clusters.csv mapping table:
+      title | keyword | cluster_id | cluster_label
+    """
+    print("\n[5] Title-first clustering...")
 
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import AgglomerativeClustering, KMeans
     from sklearn.manifold import TSNE
     from sklearn.preprocessing import normalize
     from sklearn.metrics import pairwise_distances_argmin_min
+    from sentence_transformers import SentenceTransformer
 
-    n      = len(df)
-    n_comp = min(50, kw_emb.shape[1] - 1, n - 1)
-    reduced = normalize(TruncatedSVD(n_comp, random_state=42).fit_transform(kw_emb))
+    model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    k = max(5, min(80, n // 8))
-    print(f"    → k={k} clusters for {n} keywords")
+    # ─────────────────────────────────────────────────────────────────
+    # PART A: Organic title clustering
+    # ─────────────────────────────────────────────────────────────────
 
-    labels = (
-        AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average")
-        .fit_predict(reduced)
-        if n <= 5000 else
-        KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(reduced)
+    # Step 1: Extract all individual titles with their parent keyword
+    title_cols = sorted(
+        [c for c in df.columns if re.match(r"title_\d+", c)],
+        key=lambda c: int(re.search(r"\d+", c).group())
     )
 
-    # Merge tiny clusters
-    counts    = pd.Series(labels).value_counts()
-    small     = counts[counts < min_cluster].index.tolist()
+    title_rows = []   # list of (title_text, keyword, row_index, title_position)
+
+    for row_idx, row in df.iterrows():
+        # BQ mode: enriched_text is "keyword | title1 | title2 | ..."
+        if "enriched_text" in df.columns and "|" in str(row.get("enriched_text", "")):
+            parts = [p.strip() for p in str(row["enriched_text"]).split("|")]
+            titles = parts[1:]   # skip keyword itself
+        else:
+            titles = [
+                str(row.get(c, "")).strip()
+                for c in title_cols
+                if pd.notna(row.get(c)) and str(row.get(c, "")).strip()
+            ]
+
+        for pos, title in enumerate(titles):
+            if title and len(title) > 8:
+                title_rows.append({
+                    "title":     title,
+                    "keyword":   row["keyword"],
+                    "row_idx":   row_idx,
+                    "title_pos": pos,
+                })
+
+    if not title_rows:
+        print("    ⚠ No titles found — falling back to keyword-level clustering")
+        # Fallback: simple keyword clustering
+        n      = len(df)
+        n_comp = min(50, kw_emb.shape[1] - 1, n - 1)
+        reduced = normalize(TruncatedSVD(n_comp, random_state=42).fit_transform(kw_emb))
+        k       = max(5, min(80, n // 8))
+        labels  = AgglomerativeClustering(
+            n_clusters=k, metric="cosine", linkage="average"
+        ).fit_predict(reduced)
+        label_map = {}
+        for cid in np.unique(labels):
+            mask     = labels == cid
+            embs     = reduced[mask]
+            centroid = embs.mean(axis=0)
+            closest  = df.loc[mask, "keyword"].iloc[(embs @ centroid).argmax()]
+            label_map[cid] = closest
+        df["primary_cluster_id"]    = labels
+        df["primary_cluster_label"] = [label_map[c] for c in labels]
+        df["title_cluster_ids"]     = df["primary_cluster_id"].astype(str)
+        df["title_cluster_labels"]  = df["primary_cluster_label"]
+        return df
+
+    titles_df = pd.DataFrame(title_rows)
+    n_titles  = len(titles_df)
+    print(f"    → {n_titles:,} individual titles extracted from "
+          f"{len(df):,} keywords")
+
+    # Step 2: Embed unique titles (deduplicate to save compute)
+    unique_titles = titles_df["title"].drop_duplicates().tolist()
+    print(f"    → Embedding {len(unique_titles):,} unique titles...")
+    title_embs = model.encode(
+        unique_titles,
+        show_progress_bar=True,
+        batch_size=128,
+        normalize_embeddings=True,
+    )
+    title_emb_map = {t: e for t, e in zip(unique_titles, title_embs)}
+
+    # Step 3: Cluster the title corpus
+    all_embs = np.array([title_emb_map[t] for t in titles_df["title"]])
+    n_comp   = min(50, all_embs.shape[1] - 1, n_titles - 1)
+    reduced  = normalize(
+        TruncatedSVD(n_comp, random_state=42).fit_transform(all_embs)
+    )
+
+    k = max(10, min(120, n_titles // 15))
+    print(f"    → Clustering {n_titles:,} titles into k={k} clusters...")
+
+    if n_titles <= 8000:
+        labels = AgglomerativeClustering(
+            n_clusters=k, metric="cosine", linkage="average"
+        ).fit_predict(reduced)
+    else:
+        labels = KMeans(
+            n_clusters=k, random_state=42, n_init="auto"
+        ).fit_predict(reduced)
+
+    titles_df["cluster_id"] = labels
+
+    # Merge tiny clusters into nearest neighbour
+    counts = pd.Series(labels).value_counts()
+    small  = counts[counts < min_cluster].index.tolist()
     if small:
         vm = ~np.isin(labels, small)
         sm =  np.isin(labels, small)
         if vm.sum() > 0 and sm.sum() > 0:
             nearest, _ = pairwise_distances_argmin_min(
-                reduced[sm], reduced[vm], metric="cosine")
-            labels = labels.copy()
-            labels[sm] = labels[vm][nearest]
+                reduced[sm], reduced[vm], metric="cosine"
+            )
+            labels_arr = np.array(labels)
+            labels_arr[sm] = labels_arr[vm][nearest]
+            titles_df["cluster_id"] = labels_arr
         print(f"    → Merged {len(small)} tiny clusters")
 
-    # Label each cluster by centroid-closest keyword
-    label_map = {}
-    for cid in np.unique(labels):
-        mask     = labels == cid
-        embs     = reduced[mask]
-        centroid = embs.mean(axis=0)
-        closest  = df.loc[mask, "keyword"].iloc[(embs @ centroid).argmax()]
-        label_map[cid] = closest
+    # Step 4: Label each cluster by its most centroid-representative title
+    cluster_label_map = {}
+    for cid in titles_df["cluster_id"].unique():
+        mask     = titles_df["cluster_id"] == cid
+        c_embs   = reduced[mask.values]
+        centroid = c_embs.mean(axis=0)
+        sims     = c_embs @ centroid
+        rep_title = titles_df.loc[mask, "title"].iloc[sims.argmax()]
+        # Truncate long titles for readability
+        cluster_label_map[cid] = (
+            rep_title[:60] + "..." if len(rep_title) > 60 else rep_title
+        )
 
-    df["cluster_id"]    = labels
-    df["cluster_label"] = [label_map[c] for c in labels]
-    print(f"    → {len(label_map)} sub-topic clusters produced")
+    titles_df["cluster_label"] = titles_df["cluster_id"].map(cluster_label_map)
 
-    # t-SNE for visualization
-    print("    → Running t-SNE...")
-    perp = min(30, max(5, n // 10))
-    from sklearn.manifold import TSNE
-    xy = TSNE(2, perplexity=perp, learning_rate="auto",
-              init="pca", random_state=42).fit_transform(reduced)
-    df["tsne_x"] = xy[:, 0]
-    df["tsne_y"] = xy[:, 1]
+    n_clusters = titles_df["cluster_id"].nunique()
+    print(f"    → {n_clusters} title clusters produced")
 
-    return df
+    # Step 5: Map clusters back to keywords — one row per keyword, wide format
+    # Separator: " || " (double pipe — single pipe already used in title text)
+    # primary_cluster = cluster of the keyword's highest-position title (title_1)
+    # cluster_ids / cluster_labels = all clusters spanned, deduped, position-ordered
+    kw_clusters = (
+        titles_df
+        .sort_values("title_pos")
+        .drop_duplicates(["keyword", "cluster_id"])
+        .groupby("keyword", sort=False)
+        .apply(lambda g: list(zip(g["cluster_id"].tolist(),
+                                   g["cluster_label"].tolist())))
+        .to_dict()
+    )
+
+    primary_id_list    = []
+    primary_label_list = []
+    all_ids_list       = []
+    all_labels_list    = []
+
+    for _, row in df.iterrows():
+        clusters = kw_clusters.get(row["keyword"], [])
+        if not clusters:
+            primary_id_list.append(-1)
+            primary_label_list.append("No title data")
+            all_ids_list.append("")
+            all_labels_list.append("")
+            continue
+        ids    = [str(c[0]) for c in clusters]
+        labels_kw = [c[1] for c in clusters]
+        primary_id_list.append(int(ids[0]))
+        primary_label_list.append(labels_kw[0])
+        all_ids_list.append(" || ".join(ids))
+        all_labels_list.append(" || ".join(labels_kw))
+
+    df["primary_cluster_id"]    = primary_id_list
+    df["primary_cluster_label"] = primary_label_list
+    df["cluster_ids"]           = all_ids_list     # e.g. "4 || 12 || 27"
+    df["cluster_labels"]        = all_labels_list  # e.g. "CAR-T mechanism || PD-1 trial || ..."
+
+    # Backward-compat aliases used by downstream stages
+    df["cluster_id"]    = df["primary_cluster_id"]
+    df["cluster_label"] = df["primary_cluster_label"]
+
+    multi = (df["cluster_ids"].str.contains(r"\|\|", na=False)).sum()
+    avg_n = df["cluster_ids"].str.count(r"\|\|").add(1).mean()
+    print(f"    → {multi:,} keywords span multiple title clusters")
+    print(f"    → Avg clusters per keyword: {avg_n:.1f}")
+
+    # Step 6: t-SNE on title embeddings for visualization (sample if large)
+    print("    → Running t-SNE for visualization...")
+    viz_embs = reduced
+    viz_df   = titles_df.copy()
+    if n_titles > 5000:
+        sample_idx = np.random.choice(n_titles, 5000, replace=False)
+        viz_embs   = reduced[sample_idx]
+        viz_df     = titles_df.iloc[sample_idx].copy()
+
+    perp = min(30, max(5, len(viz_embs) // 10))
+    xy   = TSNE(2, perplexity=perp, learning_rate="auto",
+                init="pca", random_state=42).fit_transform(viz_embs)
+
+    cluster_xy = {}
+    for cid in viz_df["cluster_id"].unique():
+        mask = viz_df["cluster_id"] == cid
+        if mask.any():
+            cluster_xy[cid] = xy[mask.values[:len(xy)]].mean(axis=0)
+
+    df["tsne_x"] = df["primary_cluster_id"].map(
+        lambda c: cluster_xy.get(c, np.array([0, 0]))[0]
+    )
+    df["tsne_y"] = df["primary_cluster_id"].map(
+        lambda c: cluster_xy.get(c, np.array([0, 0]))[1]
+    )
+
+    # ─────────────────────────────────────────────────────────────────
+    # PART B: AI Overview / reference snippet clustering
+    # ─────────────────────────────────────────────────────────────────
+
+    # ─────────────────────────────────────────────────────────────────
+    # PART B: AI Overview / reference snippet clustering
+    #
+    # Input: a single column of pipe-separated snippet texts per keyword,
+    # matching the same concat pattern as enriched_text / titles.
+    # e.g. "Immunotherapy uses T cells | PD-1 blocks immune checkpoints | ..."
+    #
+    # Accepted column names: aio_snippets, ai_overview, aio_snippet,
+    #                        reference_snippets, ai_snippets
+    # ─────────────────────────────────────────────────────────────────
+    print("\n    [PART B] AI Overview clustering...")
+
+    aio_col_candidates = [
+        "aio_snippets", "aio_snippet", "ai_overview",
+        "reference_snippets", "ai_snippets",
+    ]
+    aio_text_col = next(
+        (c for c in aio_col_candidates if c in df.columns), None
+    )
+    # Also accept any column matching aio_* or ai_overview_*
+    if not aio_text_col:
+        aio_text_col = next(
+            (c for c in df.columns
+             if re.match(r"(aio|ai_overview|reference_snippet)", c)), None
+        )
+
+    if not aio_text_col:
+        print("    → No AI Overview column found "
+              f"(tried: {', '.join(aio_col_candidates)})")
+        df["aio_cluster_id"]    = -1
+        df["aio_cluster_label"] = "No AI Overview"
+    else:
+        print(f"    → Using column: '{aio_text_col}'")
+
+        # Explode pipe-separated snippets into individual rows
+        # (same approach as title exploding in Part A)
+        aio_rows = []
+        for row_idx, row in df.iterrows():
+            raw = str(row.get(aio_text_col, "")).strip()
+            if not raw:
+                continue
+            snippets = [s.strip() for s in raw.split("|") if s.strip()]
+            for pos, snippet in enumerate(snippets):
+                if len(snippet) > 15:   # ignore very short fragments
+                    aio_rows.append({
+                        "snippet":  snippet,
+                        "keyword":  row["keyword"],
+                        "row_idx":  row_idx,
+                        "snip_pos": pos,
+                    })
+
+        if len(aio_rows) < 5:
+            print(f"    → Too few AIO snippets to cluster ({len(aio_rows)})")
+            df["aio_cluster_id"]    = -1
+            df["aio_cluster_label"] = "No AI Overview"
+        else:
+            aio_df   = pd.DataFrame(aio_rows)
+            n_snips  = len(aio_df)
+            n_kw_aio = aio_df["keyword"].nunique()
+            print(f"    → {n_snips:,} snippets from {n_kw_aio:,} keywords")
+
+            # Embed unique snippets
+            unique_snips = aio_df["snippet"].drop_duplicates().tolist()
+            aio_embs_raw = model.encode(
+                unique_snips,
+                show_progress_bar=False,
+                batch_size=128,
+                normalize_embeddings=True,
+            )
+            snip_emb_map = {s: e for s, e in zip(unique_snips, aio_embs_raw)}
+            all_aio_embs = np.array([snip_emb_map[s] for s in aio_df["snippet"]])
+
+            n_comp_aio  = min(30, all_aio_embs.shape[1] - 1, n_snips - 1)
+            aio_reduced = normalize(
+                TruncatedSVD(n_comp_aio, random_state=42).fit_transform(all_aio_embs)
+            )
+            k_aio = max(3, min(40, n_snips // 10))
+
+            aio_labels = (
+                AgglomerativeClustering(
+                    n_clusters=k_aio, metric="cosine", linkage="average"
+                ).fit_predict(aio_reduced)
+                if n_snips <= 5000 else
+                KMeans(n_clusters=k_aio, random_state=42, n_init="auto")
+                .fit_predict(aio_reduced)
+            )
+            aio_df["aio_cluster_id"] = aio_labels
+
+            # Label each AIO cluster by its centroid-closest snippet
+            aio_label_map = {}
+            for cid in np.unique(aio_labels):
+                mask     = aio_labels == cid
+                c_embs   = aio_reduced[mask]
+                centroid = c_embs.mean(axis=0)
+                sims     = c_embs @ centroid
+                rep      = aio_df["snippet"].iloc[np.where(mask)[0][sims.argmax()]]
+                rep_str  = str(rep)
+                aio_label_map[cid] = (
+                    rep_str[:70] + "..." if len(rep_str) > 70 else rep_str
+                )
+            aio_df["aio_cluster_label"] = aio_df["aio_cluster_id"].map(aio_label_map)
+
+            # Roll up to keyword level — one row per keyword
+            # Primary AIO cluster = cluster of first snippet (snip_pos == 0)
+            # All AIO clusters = " || " separated, position-ordered, deduped
+            aio_kw = (
+                aio_df
+                .sort_values("snip_pos")
+                .drop_duplicates(["keyword", "aio_cluster_id"])
+                .groupby("keyword", sort=False)
+                .apply(lambda g: list(zip(
+                    g["aio_cluster_id"].tolist(),
+                    g["aio_cluster_label"].tolist()
+                )))
+                .to_dict()
+            )
+
+            aio_primary_id_list    = []
+            aio_primary_label_list = []
+            aio_all_ids_list       = []
+            aio_all_labels_list    = []
+
+            for _, row in df.iterrows():
+                clusters = aio_kw.get(row["keyword"], [])
+                if not clusters:
+                    aio_primary_id_list.append(-1)
+                    aio_primary_label_list.append("No AI Overview")
+                    aio_all_ids_list.append("")
+                    aio_all_labels_list.append("")
+                    continue
+                ids    = [str(c[0]) for c in clusters]
+                labels_a = [c[1] for c in clusters]
+                aio_primary_id_list.append(int(ids[0]))
+                aio_primary_label_list.append(labels_a[0])
+                aio_all_ids_list.append(" || ".join(ids))
+                aio_all_labels_list.append(" || ".join(labels_a))
+
+            df["aio_cluster_id"]     = aio_primary_id_list
+            df["aio_cluster_label"]  = aio_primary_label_list
+            df["aio_cluster_ids"]    = aio_all_ids_list    # all AIO clusters, || sep
+            df["aio_cluster_labels"] = aio_all_labels_list
+
+            n_aio_clusters = len(aio_label_map)
+            aio_multi = (df["aio_cluster_ids"].str.contains(r"\|\|", na=False)).sum()
+            print(f"    → {n_aio_clusters} AI Overview clusters produced")
+            print(f"    → {aio_multi:,} keywords span multiple AIO clusters")
+
+    return df, titles_df
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3105,8 +3442,8 @@ def main():
     # ── Stage 4: Research area mapping
     df = map_research_areas(df, kw_emb, area_emb, args.threshold)
 
-    # ── Stage 5: Sub-topic clustering (global — for t-SNE visualization)
-    df = cluster_keywords(df, kw_emb, args.min_cluster)
+    # ── Stage 5: Title-first clustering + AIO clustering
+    df, titles_df = cluster_keywords(df, kw_emb, args.min_cluster)
 
     # ── Stage 6: Competitor landscape
     df = analyze_competitor_landscape(df)
@@ -3149,20 +3486,33 @@ def main():
     )
 
     # ── Save outputs
-    drop_cols          = ["tsne_x", "tsne_y", "enriched_text"]
-    clusters_path      = os.path.join(args.output, "clusters.csv")
-    gaps_path          = os.path.join(args.output, "gaps.csv")
-    recs_path          = os.path.join(args.output, "recommendations.csv")
-    briefs_path        = os.path.join(args.output, "content_briefs.csv")
-    serp_gaps_path     = os.path.join(args.output, "serp_content_gaps.csv")
-    wins_path          = os.path.join(args.output, "page2_fast_wins.csv")
-    fresh_path         = os.path.join(args.output, "freshness_priority.csv")
-    tc_path            = os.path.join(args.output, "topic_clusters.csv")
+    drop_cols               = ["tsne_x", "tsne_y", "enriched_text"]
+    clusters_path           = os.path.join(args.output, "clusters.csv")
+    gaps_path               = os.path.join(args.output, "gaps.csv")
+    recs_path               = os.path.join(args.output, "recommendations.csv")
+    briefs_path             = os.path.join(args.output, "content_briefs.csv")
+    serp_gaps_path          = os.path.join(args.output, "serp_content_gaps.csv")
+    wins_path               = os.path.join(args.output, "page2_fast_wins.csv")
+    fresh_path              = os.path.join(args.output, "freshness_priority.csv")
+    tc_path                 = os.path.join(args.output, "topic_clusters.csv")
+    title_cluster_map_path  = os.path.join(args.output, "title_cluster_map.csv")
+
+    # Save title-level cluster mapping
+    if titles_df is not None and len(titles_df) > 0:
+        titles_df[["title", "keyword", "cluster_id", "cluster_label"]].to_csv(
+            title_cluster_map_path, index=False
+        )
 
     df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
 
-    gap_cols = ["keyword", "research_area", "research_area_2", "cluster_label", "primary_gap",
-                "gap_score", "gap_absence", "gap_performance",
+    gap_cols = ["keyword", "research_area", "research_area_2",
+                "primary_cluster_id", "primary_cluster_label",
+                "cluster_ids", "cluster_labels",
+                "aio_cluster_id", "aio_cluster_label",
+                "aio_cluster_ids", "aio_cluster_labels",
+                "cluster_label",   # backward compat
+                "primary_gap", "gap_score",
+                "gap_absence", "gap_performance",
                 "gap_format", "gap_paa", "gap_snippet", "paa_questions",
                 "impressions", "clicks", "position", "ctr",
                 "academic_lock", "dominant_format", "serp_diversity"]
@@ -3181,15 +3531,16 @@ def main():
 
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
-    print(f"   clusters.csv          → {clusters_path}")
-    print(f"   gaps.csv              → {gaps_path}")
-    print(f"   recommendations.csv   → {recs_path}")
-    print(f"   content_briefs.csv    → {briefs_path}")
-    print(f"   serp_content_gaps.csv → {serp_gaps_path}")
-    print(f"   page2_fast_wins.csv   → {wins_path}")
-    print(f"   freshness_priority.csv→ {fresh_path}")
-    print(f"   topic_clusters.csv    → {tc_path}")
-    print(f"   report.html           → {os.path.join(args.output, 'report.html')}")
+    print(f"   clusters.csv            → {clusters_path}")
+    print(f"   title_cluster_map.csv   → {title_cluster_map_path}")
+    print(f"   gaps.csv                → {gaps_path}")
+    print(f"   recommendations.csv     → {recs_path}")
+    print(f"   content_briefs.csv      → {briefs_path}")
+    print(f"   serp_content_gaps.csv   → {serp_gaps_path}")
+    print(f"   page2_fast_wins.csv     → {wins_path}")
+    print(f"   freshness_priority.csv  → {fresh_path}")
+    print(f"   topic_clusters.csv      → {tc_path}")
+    print(f"   report.html             → {os.path.join(args.output, 'report.html')}")
     print("═" * 62)
 
     print("\n📋  Top Research Area Recommendations:\n")
