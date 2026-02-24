@@ -620,7 +620,23 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         print(f"      SERP sample: {list(serp['keyword'])[:3]}")
 
     # ── Merge — left join keeps all GSC keywords
+    # GSC metric columns (impressions, clicks, position, ctr) come from kw file.
+    # If serp file also has any of these columns they would create _x/_y suffixes
+    # or silently overwrite. Drop them from serp before merging to protect GSC values.
+    GSC_COLS = {"impressions", "clicks", "position", "ctr", "volume"}
+    serp_conflicts = [c for c in serp.columns if c in GSC_COLS]
+    if serp_conflicts:
+        print(f"    → Dropping from SERP file (protected GSC columns): "
+              f"{serp_conflicts}")
+        serp = serp.drop(columns=serp_conflicts)
+
     df = kw.merge(serp, on="keyword", how="left")
+
+    # Resolve any remaining _x/_y suffixes — always prefer _x (from kw/GSC)
+    for col in [c.replace("_x", "") for c in df.columns if c.endswith("_x")]:
+        if f"{col}_x" in df.columns:
+            df[col] = df[f"{col}_x"]
+            df = df.drop(columns=[f"{col}_x", f"{col}_y"], errors="ignore")
 
     # ── Verify impressions survived the merge
     with_impressions_before = (kw["impressions"] > 0).sum()
@@ -628,7 +644,7 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
     if with_impressions_after < with_impressions_before * 0.95:
         print(f"\n    ⚠️  Impression loss detected: "
               f"{with_impressions_before:,} → {with_impressions_after:,} after merge. "
-              f"Check for duplicate keywords in keywords.csv causing row multiplication.")
+              f"Check for duplicate keywords in SERP file causing row multiplication.")
 
     serp_col_check = "title_1" if "title_1" in df.columns else \
                      ("enriched_text" if "enriched_text" in df.columns else None)
@@ -643,6 +659,272 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
 # ═══════════════════════════════════════════════════════════════════════
 # 2. ENRICH: keyword + SERP titles → embedding text
 # ═══════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TITLE & ENRICHED TEXT CLEANING
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Two levels of cleaning, applied at different stages:
+#
+# _clean_title(text)
+#   Applied to every individual SERP title before it enters the
+#   title corpus (cluster_keywords Stage 5, mine_serp_title_gaps Stage 10).
+#   Strips publisher suffixes, boilerplate phrases, site names, encoding
+#   artifacts, and very short fragments. Returns None if nothing useful
+#   remains (caller should skip the title).
+#
+# _clean_enriched_text(text)
+#   Applied to the full pipe-joined enriched_text string in enrich_text()
+#   (Stage 2). Splits on pipe, cleans each segment individually with
+#   _clean_title, deduplicates near-identical segments, then re-joins.
+#   This is what controls keyword-level embedding quality.
+# ─────────────────────────────────────────────────────────────────────
+
+# Publisher / site name suffixes commonly appended to SERP titles.
+# Matched case-insensitively. Pattern: " - Publisher" or " | Publisher" at end.
+_PUBLISHER_SUFFIXES = re.compile(
+    r'[\s\|\-\u2013\u2014]+'
+    r'(?:'
+    # Exact multi-word publishers first (order matters — longer matches first)
+    r'new\s+england\s+journal\s+of\s+medicine|'
+    r'new\s+engl\s+j\s+med|'
+    r'clinical\s+cancer\s+research|'
+    r'nature\s+(?:communications?|medicine|methods|genetics|immunology|'
+    r'chemical\s+biology|cell\s+biology|reviews?\s+\w+)|'
+    r'cancer\s+(?:research|cell|discovery)|'
+    r'journal\s+of\s+(?:clinical\s+oncology|immunology|biological\s+chemistry|'
+    r'experimental\s+medicine|cell\s+biology|\w+)|'
+    r'annals\s+of\s+(?:oncology|internal\s+medicine|\w+)|'
+    r'frontiers\s+in\s+\w+(?:\s+\w+)?|'
+    r'cell\s+(?:reports|stem\s+cell|metabolism|host\s+microbe)|'
+    # Single-word publishers / institutions
+    r'nature|science(?:direct)?|lancet|nejm|jama|bmj|'
+    r'plos(?:\s+\w+)?|pnas|pubmed|ncbi|nih|nci|'
+    r'wiley(?:\s+online\s+library)?|springer(?:\s+link)?|elsevier|'
+    r'oxford(?:\s+academic)?|cambridge(?:\s+core)?|'
+    # Hospitals and centers
+    r'(?:mayo|cleveland)\s+clinic|'
+    r'(?:memorial\s+sloan\s+kettering|msk)\s+cancer\s+center|'
+    r'(?:md\s+anderson|dana.farber)\s+cancer\s+(?:center|institute)|'
+    r'(?:[\w\s]{3,30})\s+cancer\s+center|'
+    r'(?:[\w\s]{3,30})\s+medical\s+center|'
+    r'(?:[\w\s]{3,30})\s+university(?:\s+hospital)?|'
+    # General high-frequency sites
+    r'wikipedia|webmd|healthline|medscape|uptodate|'
+    r'verywellhealth|medicalnewstoday|drugs\.com|rxlist|emedicine|'
+    r'merck\s+manual[s]?|'
+    # Government/regulatory
+    r'ncbi\.nlm\.nih\.gov|nih\.gov|cdc\.gov|who\.int|fda\.gov|ema\.europa\.eu|'
+    # Generic "site.com" catch-all
+    r'(?:[\w\-]+\.(?:com|org|net|edu|gov|io))'
+    r')'
+    r'\s*$',
+    re.IGNORECASE,
+)
+
+# Boilerplate title suffixes that add no semantic content
+_BOILERPLATE_SUFFIXES = re.compile(
+    r'[\s\|\-\u2013\u2014:]*'
+    r'(?:'
+    r'(?:a\s+)?complete\s+guide|'
+    r'everything\s+you\s+need\s+to\s+know|'
+    r'(?:the\s+)?(?:ultimate|comprehensive|definitive|essential)\s+guide|'
+    r'what\s+you\s+need\s+to\s+know|'
+    r'all\s+you\s+need\s+to\s+know|'
+    r'updated?\s+(?:in\s+)?20\d\d|'
+    r'(?:last\s+)?updated\s+20\d\d|'
+    r'(?:new\s+in\s+)?20\d\d|'
+    # Only match "overview/review/summary" when preceded by at least one qualifier
+    r'(?:full\s+|complete\s+|detailed\s+|in.depth\s+)?'
+    r'(?:systematic\s+review|literature\s+review|narrative\s+review|'
+    r'scoping\s+review|research\s+overview|research\s+article|'
+    r'research\s+review|clinical\s+overview|clinical\s+review)|'
+    r'current\s+evidence\s+and\s+research\s+directions|'
+    r'evidence[,\s]+mechanisms?\s+and\s+research\s+implications|'
+    r'mechanisms?,?\s+current\s+evidence\s+and\s+research\s+directions|'
+    r'research\s+overview,?\s+methods?\s+and\s+key\s+findings|'
+    r'a\s+deep.dive\s+into\s+mechanisms?[,\s]+current\s+evidence[^$]*|'
+    r'read\s+more|learn\s+more|click\s+here|find\s+out\s+more|'
+    r'(?:free\s+)?(?:pdf|download)'
+    r')'
+    r'\s*$',
+    re.IGNORECASE,
+)
+
+# HTML entities
+_HTML_ENTITY_MAP = {
+    "&amp;": "&", "&lt;": "<", "&gt;": ">",
+    "&quot;": '"', "&apos;": "'", "&nbsp;": " ",
+}
+_HTML_ENTITIES = re.compile(r'&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9a-fA-F]+);')
+
+# URL pattern
+_URL_RE = re.compile(
+    r'https?://\S+|www\.\S+|\S+\.(?:com|org|net|edu|gov|io)/\S*',
+    re.IGNORECASE,
+)
+
+# Encoding artifacts: raw mojibake and hex escapes in string data
+_ENCODING_ARTIFACTS = re.compile(
+    r'â€[^\s]|'           # UTF-8 apostrophe mojibake (â€™ etc)
+    r'Ã[\x80-\xff]|'      # Latin-1 mojibake
+    r'\\x[0-9a-fA-F]{2}'  # literal \x84 style escapes
+)
+
+# Numeric-only or short catalog code strings
+_CODE_RE = re.compile(r'^(?:\d+|[a-z]{1,3}\d{3,}|[a-z0-9\-]{1,4})$', re.IGNORECASE)
+
+_MIN_SEGMENT_LEN = 12
+
+
+def _clean_title(text: str):
+    """
+    Clean a single SERP title for use in the title corpus.
+
+    Returns cleaned string, or None if nothing meaningful remains.
+
+    Steps:
+    1. Reject null/nan/empty literals
+    2. Decode HTML entities and fix encoding artifacts
+    3. Strip URLs
+    4. Strip publisher name suffixes (iteratively — can be stacked)
+    5. Strip boilerplate suffixes
+    6. Normalise whitespace
+    7. Return None if result is a catalog code or under _MIN_SEGMENT_LEN chars
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    t = text.strip()
+
+    if t.lower() in ("null", "nan", "none", "n/a", "na", "", "-"):
+        return None
+
+    # Decode HTML entities
+    def _entity_replace(m):
+        return _HTML_ENTITY_MAP.get(m.group(0), "")
+    t = _HTML_ENTITIES.sub(_entity_replace, t)
+
+    # Fix encoding artifacts
+    t = _ENCODING_ARTIFACTS.sub("", t)
+
+    # Strip URLs
+    t = _URL_RE.sub("", t).strip()
+
+    # Iteratively strip publisher suffixes (can be layered: "Title - NCI | PubMed")
+    for _ in range(4):
+        prev = t
+        t = _PUBLISHER_SUFFIXES.sub("", t).strip(" |-\u2013\u2014:")
+        if t == prev:
+            break
+
+    # Strip boilerplate suffixes
+    t = _BOILERPLATE_SUFFIXES.sub("", t).strip(" |-\u2013\u2014:")
+
+    # Normalise whitespace
+    t = re.sub(r'\s+', ' ', t).strip()
+
+    if not t or _CODE_RE.match(t) or len(t) < _MIN_SEGMENT_LEN:
+        return None
+
+    return t
+
+
+def _normalise_for_dedup(text: str) -> str:
+    """Lowercase, strip punctuation, collapse spaces — for near-duplicate detection."""
+    t = text.lower()
+    t = re.sub(r'[^a-z0-9\s]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
+def _char_trigram_sim(a: str, b: str) -> float:
+    """
+    Character trigram similarity — handles plurals, stemming variants,
+    minor rewordings better than word-level Jaccard.
+    Returns 0.0-1.0 (Dice coefficient on trigram sets).
+    """
+    def trigrams(s):
+        s = s.replace(" ", "_")  # treat spaces as char for boundary trigrams
+        return set(s[i:i+3] for i in range(len(s) - 2))
+    ta, tb = trigrams(a), trigrams(b)
+    if not ta or not tb:
+        return 0.0
+    return 2 * len(ta & tb) / (len(ta) + len(tb))
+
+
+def _token_overlap(a: str, b: str) -> float:
+    """Jaccard similarity on word token sets."""
+    sa = set(a.split())
+    sb = set(b.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _clean_enriched_text(text: str, keyword: str) -> str:
+    """
+    Clean a full pipe-joined enriched_text string from BigQuery string_agg.
+
+    Steps:
+    1. Split on "|"
+    2. First segment is the keyword — always keep as anchor
+    3. Clean every subsequent segment with _clean_title
+    4. Near-duplicate deduplication:
+       a. Exact normalised match → skip
+       b. Token Jaccard ≥ 0.85 → skip (catches plural/minor variants)
+       c. One is ≤50% length of the other and contained within it → skip
+    5. Re-join with " | "
+
+    Returns at minimum just the keyword if all SERP segments are cleaned away.
+    """
+    if not text or not isinstance(text, str):
+        return keyword
+
+    parts = [p.strip() for p in text.split("|")]
+    if not parts:
+        return keyword
+
+    cleaned = [keyword]
+    seen_normalised = {_normalise_for_dedup(keyword)}
+    # Separate pool for trigram/substring dedup — excludes keyword itself
+    # (keyword is always short and would suppress legitimate longer titles
+    # e.g. "flow cytometry" would suppress "Flow Cytometry Applications")
+    dedup_pool = []
+
+    for part in parts[1:]:
+        c = _clean_title(part)
+        if c is None:
+            continue
+        norm = _normalise_for_dedup(c)
+
+        # a. Exact normalised match (checked against all including keyword)
+        if norm in seen_normalised:
+            continue
+
+        # b. High character trigram similarity against OTHER titles (not keyword)
+        # Threshold 0.85 Dice on trigrams catches "Inhibitor" vs "Inhibitors",
+        # rewording of the same phrase, etc. while preserving distinct angles.
+        if any(_char_trigram_sim(norm, s) >= 0.85 for s in dedup_pool if len(s) > 8):
+            continue
+
+        # c. Strict substring containment — one is trivially shorter than the other
+        if any(
+            (norm in s and len(norm) <= len(s) * 0.5)
+            or (s in norm and len(s) <= len(norm) * 0.5)
+            for s in dedup_pool
+            if len(s) > 8 and len(norm) > 8
+        ):
+            continue
+
+        cleaned.append(c)
+        seen_normalised.add(norm)
+        dedup_pool.append(norm)
+
+    return " | ".join(cleaned)
+
+
 
 def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -664,22 +946,54 @@ def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── MODE A: pre-built enriched_text column from BigQuery
     if "enriched_text" in df.columns:
-        # Fill any blanks with bare keyword
+        # Clean and deduplicate each pipe-joined string_agg field
+        # This strips: URLs, publisher suffixes, boilerplate, null/nan segments,
+        # encoding artifacts, and near-duplicate titles before embedding
+        print(f"    → Using pre-built enriched_text column (BigQuery mode)")
+        print(f"    → Cleaning string_agg output (URLs, publisher suffixes, dedup)...")
         df["enriched_text"] = df.apply(
-            lambda row: row["enriched_text"]
-            if pd.notna(row["enriched_text"]) and str(row["enriched_text"]).strip()
-            else row["keyword"],
-            axis=1
+            lambda row: _clean_enriched_text(
+                str(row["enriched_text"])
+                if pd.notna(row["enriched_text"]) and str(row["enriched_text"]).strip()
+                else "",
+                row["keyword"],
+            ),
+            axis=1,
         )
         enriched = (df["enriched_text"].str.count(r"\|") > 0).sum()
-        print(f"    → Using pre-built enriched_text column (BigQuery mode)")
-        print(f"    → {enriched}/{len(df)} keywords have SERP title context")
+        avg_titles = (
+            df["enriched_text"].str.count(r"\|").mean()
+        )
+        print(f"    → {enriched:,}/{len(df):,} keywords have SERP title context "
+              f"(avg {avg_titles:.1f} titles per keyword after cleaning)")
 
         # PAA: use pre-built all_paa_questions column if present
         if "all_paa_questions" in df.columns:
-            df["paa_questions"] = df["all_paa_questions"].fillna("")
+            # Clean PAA questions — strip nulls, encoding artifacts, very short fragments
+            def _clean_paa_str(paa_text):
+                if not paa_text or not isinstance(paa_text, str) or not paa_text.strip():
+                    return ""
+                questions = []
+                seen = set()
+                for q in paa_text.split("|"):
+                    q = q.strip()
+                    if not q or q.lower() in ("null", "nan", "none", ""):
+                        continue
+                    # Decode HTML entities
+                    q = _HTML_ENTITIES.sub(lambda m: _HTML_ENTITY_MAP.get(m.group(0), ""), q)
+                    q = _ENCODING_ARTIFACTS.sub("", q).strip()
+                    if len(q) < 10:
+                        continue
+                    norm = _normalise_for_dedup(q)
+                    if norm in seen:
+                        continue
+                    seen.add(norm)
+                    questions.append(q)
+                return " | ".join(questions)
+
+            df["paa_questions"] = df["all_paa_questions"].fillna("").apply(_clean_paa_str)
             paa_count = (df["paa_questions"].str.strip() != "").sum()
-            print(f"    → {paa_count}/{len(df)} keywords have PAA questions")
+            print(f"    → {paa_count:,}/{len(df):,} keywords have PAA questions after cleaning")
         else:
             df["paa_questions"] = ""
 
@@ -695,10 +1009,11 @@ def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
 
     def build_text(row):
         parts = [str(row["keyword"])]
-        for col in title_cols:          # ALL title columns, no cap
+        for col in title_cols:
             val = row.get(col, "")
-            if pd.notna(val) and str(val).strip():
-                parts.append(str(val).strip())
+            cleaned = _clean_title(str(val)) if pd.notna(val) else None
+            if cleaned:
+                parts.append(cleaned)
         return " | ".join(parts)
 
     def build_paa(row):
@@ -784,9 +1099,71 @@ def map_research_areas(df: pd.DataFrame, kw_emb: np.ndarray,
     return df
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 5. SUB-TOPIC CLUSTERING
-# ═══════════════════════════════════════════════════════════════════════
+def _extract_cluster_theme(texts: list) -> str:
+    """
+    Derive a short descriptive label from a list of titles or snippets
+    representing one cluster.
+
+    Strategy:
+    1. Find the longest n-gram (2-5 words) that appears in ≥2 of the texts
+       AND contains at least one non-stopword — this is the shared theme.
+    2. If no recurring n-gram, return the shortest text (usually most generic/broad).
+    3. Cap at 60 characters for display.
+    """
+    import itertools
+
+    STOP = {
+        "a","an","the","and","or","of","in","to","for","on","with","is","are",
+        "was","were","be","been","as","at","by","from","that","this","which",
+        "it","its","their","our","your","we","they","he","she","you","i",
+        "how","what","why","when","where","who","not","no","can","could",
+        "may","might","will","would","should","have","has","had","do","does",
+        "did","into","than","then","about","after","before","between","other",
+        "new","more","most","also","only","both","all","any","each","some",
+        "these","those","such","but","if","so","yet","nor","via","vs","versus",
+    }
+
+    texts = [str(t).strip() for t in texts if t and len(str(t).strip()) > 5]
+    if not texts:
+        return "Unknown cluster"
+
+    # Normalise: lowercase, collapse spaces
+    normed = [re.sub(r"\s+", " ", t.lower()) for t in texts]
+
+    # Extract n-grams (2-5 words) from each text
+    def ngrams(text, n):
+        words = re.findall(r"\b[a-z][a-z\-]{1,}\b", text)
+        return [" ".join(words[i:i+n]) for i in range(len(words)-n+1)]
+
+    # Count n-gram frequency across all texts
+    ngram_counts = Counter()
+    for text in normed:
+        seen = set()
+        for n in range(5, 1, -1):
+            for ng in ngrams(text, n):
+                if ng not in seen:
+                    ngram_counts[ng] += 1
+                    seen.add(ng)
+
+    # Filter: must appear in ≥2 texts, must have ≥1 non-stopword,
+    # prefer longer n-grams
+    candidates = [
+        (ng, cnt) for ng, cnt in ngram_counts.items()
+        if cnt >= 2
+        and any(w not in STOP for w in ng.split())
+        and not all(w in STOP for w in ng.split())
+    ]
+
+    if candidates:
+        # Sort by (count desc, length desc) — most shared + most specific
+        best = sorted(candidates, key=lambda x: (x[1], len(x[0])), reverse=True)
+        label = best[0][0].title()
+        return label[:60] + "..." if len(label) > 60 else label
+
+    # Fallback: shortest text (tends to be the broadest/most general)
+    fallback = min(texts, key=len)
+    return fallback[:60] + "..." if len(fallback) > 60 else fallback
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. TITLE-FIRST CLUSTERING + AI OVERVIEW CLUSTERING
@@ -824,7 +1201,7 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
 
     from sklearn.decomposition import TruncatedSVD
     from sklearn.cluster import AgglomerativeClustering, KMeans
-    from sklearn.manifold import TSNE
+    from sklearn.manifold import TSNE  # kept for potential future use
     from sklearn.preprocessing import normalize
     from sklearn.metrics import pairwise_distances_argmin_min
     from sentence_transformers import SentenceTransformer
@@ -856,9 +1233,10 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             ]
 
         for pos, title in enumerate(titles):
-            if title and len(title) > 8:
+            cleaned = _clean_title(title)
+            if cleaned:
                 title_rows.append({
-                    "title":     title,
+                    "title":     cleaned,
                     "keyword":   row["keyword"],
                     "row_idx":   row_idx,
                     "title_pos": pos,
@@ -937,25 +1315,27 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             titles_df["cluster_id"] = labels_arr
         print(f"    → Merged {len(small)} tiny clusters")
 
-    # Step 4: Label each cluster by its most centroid-representative title
+    # Step 4: Label each cluster by extracting the core theme across its
+    # top-3 most centroid-representative titles.
+    # Strategy: find the longest common meaningful phrase across top titles;
+    # fall back to the single most representative title if no phrase found.
     cluster_label_map = {}
     for cid in titles_df["cluster_id"].unique():
         mask     = titles_df["cluster_id"] == cid
         c_embs   = reduced[mask.values]
         centroid = c_embs.mean(axis=0)
         sims     = c_embs @ centroid
-        rep_title = titles_df.loc[mask, "title"].iloc[sims.argmax()]
-        # Truncate long titles for readability
-        cluster_label_map[cid] = (
-            rep_title[:60] + "..." if len(rep_title) > 60 else rep_title
-        )
+        top_idx  = sims.argsort()[::-1][:5]
+        top_titles = titles_df.loc[mask, "title"].iloc[top_idx].tolist()
+
+        # Find common meaningful n-gram across top titles
+        label = _extract_cluster_theme(top_titles)
+        cluster_label_map[cid] = label
 
     titles_df["cluster_label"] = titles_df["cluster_id"].map(cluster_label_map)
 
     n_clusters = titles_df["cluster_id"].nunique()
     print(f"    → {n_clusters} title clusters produced")
-
-    # Step 5: Map clusters back to keywords — one row per keyword, wide format
     # Separator: " || " (double pipe — single pipe already used in title text)
     # primary_cluster = cluster of the keyword's highest-position title (title_1)
     # cluster_ids / cluster_labels = all clusters spanned, deduped, position-ordered
@@ -1002,36 +1382,6 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
     avg_n = df["cluster_ids"].str.count(r"\|\|").add(1).mean()
     print(f"    → {multi:,} keywords span multiple title clusters")
     print(f"    → Avg clusters per keyword: {avg_n:.1f}")
-
-    # Step 6: t-SNE on title embeddings for visualization (sample if large)
-    print("    → Running t-SNE for visualization...")
-    viz_embs = reduced
-    viz_df   = titles_df.copy()
-    if n_titles > 5000:
-        sample_idx = np.random.choice(n_titles, 5000, replace=False)
-        viz_embs   = reduced[sample_idx]
-        viz_df     = titles_df.iloc[sample_idx].copy()
-
-    perp = min(30, max(5, len(viz_embs) // 10))
-    xy   = TSNE(2, perplexity=perp, learning_rate="auto",
-                init="pca", random_state=42).fit_transform(viz_embs)
-
-    cluster_xy = {}
-    for cid in viz_df["cluster_id"].unique():
-        mask = viz_df["cluster_id"] == cid
-        if mask.any():
-            cluster_xy[cid] = xy[mask.values[:len(xy)]].mean(axis=0)
-
-    df["tsne_x"] = df["primary_cluster_id"].map(
-        lambda c: cluster_xy.get(c, np.array([0, 0]))[0]
-    )
-    df["tsne_y"] = df["primary_cluster_id"].map(
-        lambda c: cluster_xy.get(c, np.array([0, 0]))[1]
-    )
-
-    # ─────────────────────────────────────────────────────────────────
-    # PART B: AI Overview / reference snippet clustering
-    # ─────────────────────────────────────────────────────────────────
 
     # ─────────────────────────────────────────────────────────────────
     # PART B: AI Overview / reference snippet clustering
@@ -1121,18 +1471,19 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             )
             aio_df["aio_cluster_id"] = aio_labels
 
-            # Label each AIO cluster by its centroid-closest snippet
+            # Label each AIO cluster by extracting the shared theme
+            # across the top-3 most centroid-representative snippets
             aio_label_map = {}
             for cid in np.unique(aio_labels):
                 mask     = aio_labels == cid
                 c_embs   = aio_reduced[mask]
                 centroid = c_embs.mean(axis=0)
                 sims     = c_embs @ centroid
-                rep      = aio_df["snippet"].iloc[np.where(mask)[0][sims.argmax()]]
-                rep_str  = str(rep)
-                aio_label_map[cid] = (
-                    rep_str[:70] + "..." if len(rep_str) > 70 else rep_str
-                )
+                top_idx  = sims.argsort()[::-1][:5]
+                top_snips = aio_df["snippet"].iloc[
+                    np.where(mask)[0][top_idx]
+                ].tolist()
+                aio_label_map[cid] = _extract_cluster_theme(top_snips)
             aio_df["aio_cluster_label"] = aio_df["aio_cluster_id"].map(aio_label_map)
 
             # Roll up to keyword level — one row per keyword
@@ -1581,44 +1932,88 @@ def generate_report(df: pd.DataFrame, recs: pd.DataFrame, output_dir: str,
                     visibility_html: str = ""):
     print("\n    → Generating HTML report...")
 
-    # ── Scatter coloured by research area
+    # ── Hierarchical bubble map: Research Area → Cluster → Keywords
+    # Three-level sunburst/treemap: area (parent) > cluster (child) > keyword (leaf)
+    # Size = impressions (or 1 if no impressions)
     try:
         import plotly.express as px
         import plotly.io as pio
 
-        hover = ["keyword", "research_area", "research_area_2", "primary_gap",
-                 "gap_score", "position", "cluster_label"]
-        hover = [c for c in hover if c in df.columns]
-
-        fig = px.scatter(
-            df, x="tsne_x", y="tsne_y",
-            color="research_area",
-            symbol="primary_gap",
-            hover_data=hover,
-            title="Keyword Map — Research Areas & Gap Types",
-            labels={"tsne_x": "t-SNE 1", "tsne_y": "t-SNE 2",
-                    "research_area": "Research Area",
-                    "primary_gap":   "Primary Gap"},
-            height=800, template="plotly_white"
+        plot_df = df.copy()
+        plot_df["impressions_sz"] = (
+            pd.to_numeric(plot_df.get("impressions", 0), errors="coerce")
+            .fillna(0)
+            .clip(lower=1)
         )
-        fig.update_traces(marker=dict(size=6, opacity=0.75))
+        plot_df["area"]    = plot_df["research_area"].fillna("Unclassified")
+        plot_df["cluster"] = plot_df["primary_cluster_label"].fillna("Unknown")
+        plot_df["kw"]      = plot_df["keyword"]
+        plot_df["gap"]     = plot_df.get("primary_gap", "Unknown").fillna("Unknown")
+        plot_df["pos"]     = pd.to_numeric(
+            plot_df.get("position", 999), errors="coerce"
+        ).fillna(999).round(1)
+
+        # Remove unclassified to keep map clean
+        plot_df = plot_df[plot_df["area"] != "Unclassified / General Methods"]
+
+        # Treemap: area > cluster > keyword
+        # Each keyword leaf sized by impressions, coloured by gap type
+        fig = px.treemap(
+            plot_df,
+            path=["area", "cluster", "kw"],
+            values="impressions_sz",
+            color="gap",
+            color_discrete_map={
+                "Absence":     "#dc3545",
+                "Performance": "#fd7e14",
+                "PAA":         "#0077b6",
+                "Format":      "#6610f2",
+                "Snippet":     "#198754",
+                "None":        "#adb5bd",
+            },
+            hover_data={"pos": True, "impressions_sz": True, "gap": True},
+            title="Keyword Map — Research Area → Cluster → Keyword",
+            height=900,
+        )
+        fig.update_traces(
+            textinfo="label",
+            hovertemplate=(
+                "<b>%{label}</b><br>"
+                "Gap: %{color}<br>"
+                "Position: %{customdata[0]}<br>"
+                "Impressions: %{customdata[1]:,}<br>"
+                "<extra></extra>"
+            ),
+        )
+        fig.update_layout(
+            margin=dict(t=50, l=10, r=10, b=10),
+            template="plotly_white",
+        )
         scatter_html = pio.to_html(fig, full_html=False, include_plotlyjs="cdn")
 
-        # Gap breakdown bar chart
+        # Gap breakdown bar chart (unchanged)
         gap_data = pd.DataFrame({
             "Gap Type": ["Absence", "Performance", "Format", "PAA", "Snippet"],
             "Count":    [
-                int(df["gap_absence"].sum()),
-                int(df["gap_performance"].sum()),
-                int(df["gap_format"].sum()),
-                int(df["gap_paa"].sum()),
-                int(df["gap_snippet"].sum()),
+                int(df.get("gap_absence",     pd.Series(0)).sum()),
+                int(df.get("gap_performance", pd.Series(0)).sum()),
+                int(df.get("gap_format",      pd.Series(0)).sum()),
+                int(df.get("gap_paa",         pd.Series(0)).sum()),
+                int(df.get("gap_snippet",     pd.Series(0)).sum()),
             ]
         })
         fig2 = px.bar(
             gap_data, x="Gap Type", y="Count",
             title="Gap Type Distribution Across All Keywords",
-            color="Gap Type", template="plotly_white", height=350
+            color="Gap Type",
+            color_discrete_map={
+                "Absence":     "#dc3545",
+                "Performance": "#fd7e14",
+                "Format":      "#6610f2",
+                "PAA":         "#0077b6",
+                "Snippet":     "#198754",
+            },
+            template="plotly_white", height=350
         )
         bar_html = pio.to_html(fig2, full_html=False, include_plotlyjs=False)
 
@@ -2279,7 +2674,8 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
     return briefs_out
 
 
-def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str) -> str:
+def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str,
+                          total_briefs: int = None) -> str:
     if briefs_df is None or len(briefs_df) == 0:
         return ""
 
@@ -2399,7 +2795,7 @@ def generate_briefs_html(briefs_df: pd.DataFrame, output_dir: str) -> str:
         </div>"""
 
     return f"""
-  <h2>📝 Content Briefs ({len(briefs_df)} Recommendations)</h2>
+  <h2>📝 Content Briefs (showing top {len(briefs_df)}{f" of {total_briefs}" if total_briefs and total_briefs > len(briefs_df) else ""} Recommendations)</h2>
   <div style='margin-bottom:16px;font-size:0.87em;color:#555;
               background:#f8f9fa;border-radius:8px;padding:12px 16px'>
     Briefs are ranked by opportunity score within each tier.
@@ -2481,9 +2877,10 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         paas    = [q.strip() for q in paa_str.split("|") if q.strip() and len(q.strip()) > 8]
 
         for title in titles:
-            if title and len(title) > 10 and title.lower() != keyword:
+            cleaned = _clean_title(title)
+            if cleaned and cleaned.lower() != keyword:
                 title_rows.append({
-                    "title":         title,
+                    "title":         cleaned,
                     "keyword":       keyword,
                     "research_area": area,
                     "position":      position,
@@ -2763,9 +3160,10 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
             print(f"       Uncontested: {first}...")
         print()
 
-    # ── Build HTML section
+    # ── Build HTML section (top 25 only — full 50 in serp_content_gaps.csv)
+    html_gaps = gaps_df.head(25)
     gap_cards = ""
-    for rank, row in gaps_df.iterrows():
+    for rank, row in html_gaps.iterrows():
         gap_colour = {
             "Uncontested Angle": "#0077b6",
             "Topic Void":        "#dc3545",
@@ -2873,7 +3271,7 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
         </div>"""
 
     serp_gaps_html = f"""
-  <h2>🔍 SERP Content Angle Gaps ({len(gaps_df)} Identified)</h2>
+  <h2>🔍 SERP Content Angle Gaps (showing top {len(html_gaps)} of {len(gaps_df)})</h2>
   <div style='margin-bottom:16px;font-size:0.87em;color:#555;
               background:#f8f9fa;border-radius:8px;padding:12px 16px'>
     These gaps are derived from mining what top-ranking SERP titles cover —
@@ -3619,13 +4017,15 @@ def main():
 
     # ── Stage 9: Content briefs (per-area clustering, relevance-gated)
     briefs_df   = generate_content_briefs(
-        df, kw_emb, area_emb, model, recs, args.output, n_briefs=25
+        df, kw_emb, area_emb, model, recs, args.output, n_briefs=50
     )
-    briefs_html = generate_briefs_html(briefs_df, args.output)
+    # HTML view: top 25 only (full 50 in content_briefs.csv)
+    briefs_html = generate_briefs_html(briefs_df.head(25), args.output,
+                                        total_briefs=len(briefs_df))
 
     # ── Stage 10: SERP title mining — content angle gaps (relevance-gated)
     serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
-        df, args.output, model, area_emb, n_gaps=25
+        df, args.output, model, area_emb, n_gaps=50
     )
 
     # ── Stage 11: Search intent classification
@@ -3649,7 +4049,7 @@ def main():
     )
 
     # ── Save outputs
-    drop_cols               = ["tsne_x", "tsne_y", "enriched_text"]
+    drop_cols               = ["enriched_text"]
     clusters_path           = os.path.join(args.output, "clusters.csv")
     gaps_path               = os.path.join(args.output, "gaps.csv")
     recs_path               = os.path.join(args.output, "recommendations.csv")
@@ -3741,7 +4141,7 @@ def main():
                 "gap_absence", "gap_performance",
                 "gap_format", "gap_paa", "gap_snippet", "paa_questions",
                 "impressions", "clicks", "position", "ctr",
-                "academic_lock", "dominant_format", "serp_diversity"]
+                "dominant_format", "serp_diversity"]
     gap_cols = [c for c in gap_cols if c in df.columns]
     (
         df[(df["primary_gap"] != "None") & (df["gap_score"] >= 0.15)][gap_cols]
