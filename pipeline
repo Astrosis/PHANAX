@@ -1455,6 +1455,8 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
     print("\n[5] Title-first clustering...")
 
     from sklearn.preprocessing import normalize
+    from sklearn.decomposition import TruncatedSVD
+    from sklearn.cluster import AgglomerativeClustering, KMeans
     from sklearn.metrics import pairwise_distances_argmin_min
     from sentence_transformers import SentenceTransformer
 
@@ -1718,8 +1720,8 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             if not raw:
                 continue
             snippets = [s.strip() for s in raw.split("|") if s.strip()]
-            for pos, snippet in enumerate(snippets):
-                if len(snippet) > 15:   # ignore very short fragments
+            for pos, snippet in enumerate(snippets[:5]):   # cap at 5 per keyword
+                if len(snippet) > 15:
                     aio_rows.append({
                         "snippet":  snippet,
                         "keyword":  row["keyword"],
@@ -1737,31 +1739,49 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             n_kw_aio = aio_df["keyword"].nunique()
             print(f"    → {n_snips:,} snippets from {n_kw_aio:,} keywords")
 
-            # Embed unique snippets
+            # AIO snippets use a lighter model — MiniLM is fast and sufficient
+            # for coarse-grained snippet clustering. PubMedBERT is reserved for
+            # keyword/title embeddings where biological entity discrimination matters.
+            from sentence_transformers import SentenceTransformer as _ST
+            aio_model = _ST("all-MiniLM-L6-v2")
+            print(f"    → Encoding with all-MiniLM-L6-v2 (faster for long snippets)")
+
+            # Embed unique snippets — truncate long snippets to save time
             unique_snips = aio_df["snippet"].drop_duplicates().tolist()
+            # Truncate snippets to 128 chars — AIO snippets are long but the
+            # first ~128 chars carry the topic signal; the rest is elaboration
+            unique_snips_trunc = [s[:200] for s in unique_snips]
+
             aio_embs_raw = cached_encode(
-                unique_snips, model, _EMB_CACHE_DIR,
+                unique_snips_trunc, aio_model, _EMB_CACHE_DIR,
                 label=f"AIO snippets ({len(unique_snips):,} unique)",
                 batch_size=256,
-                show_progress_bar=False,
+                show_progress_bar=True,
             )
             snip_emb_map = {s: e for s, e in zip(unique_snips, aio_embs_raw)}
             all_aio_embs = np.array([snip_emb_map[s] for s in aio_df["snippet"]])
 
-            n_comp_aio  = min(30, all_aio_embs.shape[1] - 1, n_snips - 1)
-            aio_reduced = normalize(
-                TruncatedSVD(n_comp_aio, random_state=42).fit_transform(all_aio_embs)
+            # Reduce + cluster with same helpers as Part A
+            print(f"    → Reducing AIO embeddings...")
+            aio_reduced = _reduce_embeddings(
+                all_aio_embs,
+                n_components=min(10, all_aio_embs.shape[1]-1, n_snips-2),
+                have_umap=_HAVE_UMAP
             )
-            k_aio = max(3, min(40, n_snips // 10))
+            aio_labels = _cluster_embeddings(
+                aio_reduced, min_size=3, have_hdbscan=_HAVE_HDBSCAN
+            )
 
-            aio_labels = (
-                AgglomerativeClustering(
-                    n_clusters=k_aio, metric="cosine", linkage="average"
-                ).fit_predict(aio_reduced)
-                if n_snips <= 5000 else
-                KMeans(n_clusters=k_aio, random_state=42, n_init="auto")
-                .fit_predict(aio_reduced)
-            )
+            # Assign noise to nearest cluster
+            if -1 in aio_labels:
+                noise_mask = aio_labels == -1
+                valid_mask = aio_labels != -1
+                if valid_mask.sum() > 0:
+                    nearest, _ = pairwise_distances_argmin_min(
+                        aio_reduced[noise_mask], aio_reduced[valid_mask]
+                    )
+                    aio_labels[noise_mask] = aio_labels[valid_mask][nearest]
+
             aio_df["aio_cluster_id"] = aio_labels
 
             # Label each AIO cluster by extracting the shared theme
