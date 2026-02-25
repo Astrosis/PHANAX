@@ -540,8 +540,30 @@ REGEX_FILTERS = [
     r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",
 ]
 
+# ── Embedding model
+# PubMedBERT fine-tuned on MS-MARCO: understands biomedical entity names,
+# drug synonyms, gene/protein relationships far better than general English models.
+# Same sentence-transformers API — drop-in replacement.
+# First run downloads ~440MB; subsequent runs load from local HuggingFace cache.
+# Delete .embedding_cache/ before first run to force re-embedding with new model.
+EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
+
 # Compile regex filters once at import time
 _COMPILED_REGEX = [re.compile(p) for p in REGEX_FILTERS]
+
+# PAA questions matching these patterns are biographical/crime/celebrity junk
+# that bleeds into life-science SERP data via tangential keyword associations.
+# e.g. "Did Ted Bundy have MAOA gene" for MAOA-related keywords.
+_JUNK_PAA_PATTERNS = re.compile(
+    r'\b(who (?:is|was|are|were)|did .{1,30} (?:have|kill|die|commit|go to'
+    r'|marry|win|lose|meet)|when did .{1,20} (?:die|born|start|end|happen)'
+    r'|where (?:is|was) .{1,20} (?:born|from|live|buried)'
+    r'|how (?:old|tall|much|many) (?:is|was) [A-Z]'
+    r'|what (?:happened|did) .{1,20} do'
+    r'|is .{1,30} (?:a serial|a murderer|a criminal|in jail|dead|alive)'
+    r'|celebrity|serial killer|murderer|crime|prison|arrested)\b',
+    re.IGNORECASE
+)
 
 
 def _should_filter_keyword(kw: str) -> tuple[bool, str]:
@@ -1122,16 +1144,17 @@ def embed_all(df: pd.DataFrame, cache_dir: str):
     except ImportError:
         raise ImportError("Run: pip install sentence-transformers")
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    print(f"    → Loading model: {EMBEDDING_MODEL}")
+    model = SentenceTransformer(EMBEDDING_MODEL)
 
     kw_emb = cached_encode(
         df["enriched_text"].tolist(), model, cache_dir,
-        label="keyword enriched texts", batch_size=256,
+        label="keyword enriched texts", batch_size=64,   # smaller batch — larger model
     )
 
     area_emb = cached_encode(
         [a["description"] for a in RESEARCH_AREAS], model, cache_dir,
-        label="research area taxonomy", batch_size=256,
+        label="research area taxonomy", batch_size=64,
         show_progress_bar=False,
     )
 
@@ -1327,6 +1350,80 @@ def _extract_cluster_theme(texts: list) -> str:
 # 5. TITLE-FIRST CLUSTERING + AI OVERVIEW CLUSTERING
 # ═══════════════════════════════════════════════════════════════════════
 
+
+def _reduce_embeddings(embs: np.ndarray, n_components: int = 15,
+                       have_umap: bool = True) -> np.ndarray:
+    """
+    Reduce high-dimensional embeddings for clustering.
+
+    UMAP (preferred): non-linear, preserves local neighbourhood structure,
+    far better than linear SVD at keeping biologically-related concepts close.
+    n_components=15 is a good balance — enough for HDBSCAN to find structure,
+    not so many that density estimation degrades.
+
+    TruncatedSVD (fallback): linear, faster, but discards fine-grained
+    biological distinctions that live in lower-variance dimensions.
+    """
+    from sklearn.preprocessing import normalize
+
+    n, dim = embs.shape
+    n_comp = min(n_components, dim - 1, n - 2)
+
+    if have_umap:
+        import umap as umap_lib
+        reducer = umap_lib.UMAP(
+            n_components    = n_comp,
+            metric          = "cosine",
+            n_neighbors     = max(5, min(30, n // 20)),
+            min_dist        = 0.0,    # tighter clusters — better for HDBSCAN
+            random_state    = 42,
+            low_memory      = True,
+        )
+        return reducer.fit_transform(embs)
+    else:
+        from sklearn.decomposition import TruncatedSVD
+        reduced = TruncatedSVD(n_comp, random_state=42).fit_transform(embs)
+        return normalize(reduced)
+
+
+def _cluster_embeddings(reduced: np.ndarray, min_size: int,
+                        have_hdbscan: bool = True) -> np.ndarray:
+    """
+    Cluster reduced embeddings.
+
+    HDBSCAN (preferred): density-based, finds natural cluster count,
+    marks genuine outliers as -1 rather than forcing them into a cluster.
+    min_cluster_size controls the smallest meaningful cluster.
+
+    AgglomerativeClustering (fallback): requires fixed k, uses
+    n // 15 heuristic. Produces reasonable but less semantically
+    coherent clusters than HDBSCAN on biomedical text.
+    """
+    n = len(reduced)
+
+    if have_hdbscan:
+        import hdbscan as hdbscan_lib
+        clusterer = hdbscan_lib.HDBSCAN(
+            min_cluster_size    = max(min_size, 3),
+            min_samples         = 2,
+            metric              = "euclidean",   # on UMAP output = cosine-aware
+            cluster_selection_method = "eom",    # excess of mass — better for varied densities
+            prediction_data     = True,
+        )
+        return clusterer.fit_predict(reduced)
+    else:
+        from sklearn.cluster import AgglomerativeClustering, KMeans
+        k = max(10, min(120, n // 15))
+        if n <= 8000:
+            return AgglomerativeClustering(
+                n_clusters=k, metric="cosine", linkage="average"
+            ).fit_predict(reduced)
+        else:
+            return KMeans(
+                n_clusters=k, random_state=42, n_init="auto"
+            ).fit_predict(reduced)
+
+
 def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
                      min_cluster: int, model) -> pd.DataFrame:
     """
@@ -1357,14 +1454,28 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
     """
     print("\n[5] Title-first clustering...")
 
-    from sklearn.decomposition import TruncatedSVD
-    from sklearn.cluster import AgglomerativeClustering, KMeans
-    from sklearn.manifold import TSNE  # kept for potential future use
     from sklearn.preprocessing import normalize
     from sklearn.metrics import pairwise_distances_argmin_min
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    print(f"    → Loading model: {EMBEDDING_MODEL}")
+    model = SentenceTransformer(EMBEDDING_MODEL)
+
+    try:
+        import umap
+        _HAVE_UMAP = True
+    except ImportError:
+        _HAVE_UMAP = False
+        print("    ⚠ umap-learn not installed — falling back to TruncatedSVD")
+        print("      Install with: pip install umap-learn")
+
+    try:
+        import hdbscan as hdbscan_lib
+        _HAVE_HDBSCAN = True
+    except ImportError:
+        _HAVE_HDBSCAN = False
+        print("    ⚠ hdbscan not installed — falling back to AgglomerativeClustering")
+        print("      Install with: pip install hdbscan")
 
     # ─────────────────────────────────────────────────────────────────
     # PART A: Organic title clustering
@@ -1402,23 +1513,41 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
 
     if not title_rows:
         print("    ⚠ No titles found — falling back to keyword-level clustering")
-        # Fallback: simple keyword clustering
         n      = len(df)
-        n_comp = min(50, kw_emb.shape[1] - 1, n - 1)
-        reduced = normalize(TruncatedSVD(n_comp, random_state=42).fit_transform(kw_emb))
-        k       = max(5, min(80, n // 8))
-        labels  = AgglomerativeClustering(
-            n_clusters=k, metric="cosine", linkage="average"
-        ).fit_predict(reduced)
+        reduced = _reduce_embeddings(kw_emb, n_components=10, have_umap=_HAVE_UMAP)
+        labels  = _cluster_embeddings(reduced, min_cluster, have_hdbscan=_HAVE_HDBSCAN)
         label_map = {}
         for cid in np.unique(labels):
+            if cid == -1:
+                continue
             mask     = labels == cid
             embs     = reduced[mask]
             centroid = embs.mean(axis=0)
-            closest  = df.loc[mask, "keyword"].iloc[(embs @ centroid).argmax()]
+            closest  = df.iloc[np.where(mask)[0]]["keyword"].iloc[
+                (embs @ centroid).argmax()
+            ]
             label_map[cid] = closest
+        # Noise points (-1) get assigned to nearest valid cluster
+        if -1 in np.unique(labels):
+            noise_mask  = labels == -1
+            valid_mask  = labels != -1
+            if valid_mask.sum() > 0:
+                nearest, _ = pairwise_distances_argmin_min(
+                    reduced[noise_mask], reduced[valid_mask]
+                )
+                labels_arr        = labels.copy()
+                labels_arr[noise_mask] = labels[valid_mask][nearest]
+                labels = labels_arr
+                for cid in np.unique(labels):
+                    if cid not in label_map:
+                        mask = labels == cid
+                        embs = reduced[mask]
+                        centroid = embs.mean(axis=0)
+                        label_map[cid] = df.iloc[np.where(mask)[0]]["keyword"].iloc[
+                            (embs @ centroid).argmax()
+                        ]
         df["primary_cluster_id"]    = labels
-        df["primary_cluster_label"] = [label_map[c] for c in labels]
+        df["primary_cluster_label"] = [label_map.get(c, "Unknown") for c in labels]
         df["title_cluster_ids"]     = df["primary_cluster_id"].astype(str)
         df["title_cluster_labels"]  = df["primary_cluster_label"]
         return df
@@ -1439,39 +1568,45 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
 
     # Step 3: Cluster the title corpus
     all_embs = np.array([title_emb_map[t] for t in titles_df["title"]])
-    n_comp   = min(50, all_embs.shape[1] - 1, n_titles - 1)
-    reduced  = normalize(
-        TruncatedSVD(n_comp, random_state=42).fit_transform(all_embs)
-    )
 
-    k = max(10, min(120, n_titles // 15))
-    print(f"    → Clustering {n_titles:,} titles into k={k} clusters...")
+    print(f"    → Reducing {n_titles:,} title embeddings...")
+    reduced = _reduce_embeddings(all_embs, n_components=15, have_umap=_HAVE_UMAP)
 
-    if n_titles <= 8000:
-        labels = AgglomerativeClustering(
-            n_clusters=k, metric="cosine", linkage="average"
-        ).fit_predict(reduced)
-    else:
-        labels = KMeans(
-            n_clusters=k, random_state=42, n_init="auto"
-        ).fit_predict(reduced)
+    print(f"    → Clustering with HDBSCAN (auto k)..." if _HAVE_HDBSCAN else
+          f"    → Clustering with AgglomerativeClustering (k={max(10, min(120, n_titles//15))})...")
+    labels = _cluster_embeddings(reduced, min_cluster, have_hdbscan=_HAVE_HDBSCAN)
 
     titles_df["cluster_id"] = labels
 
-    # Merge tiny clusters into nearest neighbour
-    counts = pd.Series(labels).value_counts()
-    small  = counts[counts < min_cluster].index.tolist()
-    if small:
-        vm = ~np.isin(labels, small)
-        sm =  np.isin(labels, small)
-        if vm.sum() > 0 and sm.sum() > 0:
-            nearest, _ = pairwise_distances_argmin_min(
-                reduced[sm], reduced[vm], metric="cosine"
-            )
-            labels_arr = np.array(labels)
-            labels_arr[sm] = labels_arr[vm][nearest]
-            titles_df["cluster_id"] = labels_arr
-        print(f"    → Merged {len(small)} tiny clusters")
+    # Assign HDBSCAN noise points (-1) to nearest valid cluster
+    # (For AgglomerativeClustering fallback, merge tiny clusters instead)
+    if _HAVE_HDBSCAN:
+        noise_mask = labels == -1
+        if noise_mask.sum() > 0:
+            valid_mask = labels != -1
+            if valid_mask.sum() > 0:
+                nearest, _ = pairwise_distances_argmin_min(
+                    reduced[noise_mask], reduced[valid_mask]
+                )
+                labels_arr           = np.array(labels)
+                labels_arr[noise_mask] = labels_arr[valid_mask][nearest]
+                titles_df["cluster_id"] = labels_arr
+                labels = labels_arr
+            print(f"    → {noise_mask.sum()} noise titles assigned to nearest cluster")
+    else:
+        counts = pd.Series(labels).value_counts()
+        small  = counts[counts < min_cluster].index.tolist()
+        if small:
+            vm = ~np.isin(labels, small)
+            sm =  np.isin(labels, small)
+            if vm.sum() > 0 and sm.sum() > 0:
+                nearest, _ = pairwise_distances_argmin_min(
+                    reduced[sm], reduced[vm], metric="cosine"
+                )
+                labels_arr = np.array(labels)
+                labels_arr[sm] = labels_arr[vm][nearest]
+                titles_df["cluster_id"] = labels_arr
+            print(f"    → Merged {len(small)} tiny clusters")
 
     # Step 4: Label each cluster by extracting the core theme across its
     # top-3 most centroid-representative titles.
@@ -1757,9 +1892,22 @@ def analyze_competitor_landscape(df: pd.DataFrame) -> pd.DataFrame:
                 break
         dominant_format_list.append(dominant)
 
-        # ── SERP diversity: distinct first words = titles covering different angles
-        first_words = {t.split()[0] for t in titles if t}
-        serp_diversity_list.append(round(len(first_words) / max(len(titles), 1), 2))
+        # ── SERP diversity: mean pairwise token dissimilarity across titles
+        # Much better than first-word count — "Mechanisms of X" vs "Mechanisms of Y"
+        # score 0 on first-word but are semantically different topics.
+        if len(titles) >= 2:
+            def _title_tokens(t):
+                return set(re.findall(r'\b[a-z]{3,}\b', t.lower()))
+            pairs = []
+            for i in range(len(titles)):
+                for j in range(i+1, len(titles)):
+                    a, b = _title_tokens(titles[i]), _title_tokens(titles[j])
+                    union = len(a | b)
+                    overlap = len(a & b) / union if union else 0
+                    pairs.append(1 - overlap)   # dissimilarity
+            serp_diversity_list.append(round(sum(pairs) / len(pairs), 2))
+        else:
+            serp_diversity_list.append(0.5)
 
     df["academic_lock"]   = academic_lock_list
     df["dominant_format"] = dominant_format_list
@@ -1851,6 +1999,7 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
         df["gap_snippet"] = False
 
     # ── Composite gap score
+    # Binary gap signal (0-1) weighted by gap type importance
     weights = {
         "gap_absence":     0.40,   # highest — no presence = biggest gap
         "gap_performance": 0.30,   # second — visible but losing
@@ -1858,9 +2007,22 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
         "gap_format":      0.10,   # content type opportunity
         "gap_snippet":     0.05,   # featured snippet opportunity
     }
-    df["gap_score"] = sum(
+    binary_gap = sum(
         df[col].astype(float) * w for col, w in weights.items()
-    ).round(3)
+    )
+
+    # Weight by impression demand — a 50k-impression gap is more valuable
+    # than a 100-impression gap of the same type. Log-scale to avoid
+    # very large keywords dominating entirely.
+    if df["impressions"].max() > 0:
+        imp_weight = (
+            np.log1p(df["impressions"]) /
+            np.log1p(df["impressions"].max())
+        )
+        # Blend: 65% gap type, 35% demand signal
+        df["gap_score"] = (binary_gap * 0.65 + imp_weight * 0.35).round(3)
+    else:
+        df["gap_score"] = binary_gap.round(3)
 
     # ── Primary gap label for quick reading
     def primary_gap(row):
@@ -1880,64 +2042,6 @@ def analyze_gaps(df: pd.DataFrame) -> pd.DataFrame:
         "PAA":         int(df["gap_paa"].sum()),
         "Format":      int(df["gap_format"].sum()),
         "Snippet":     int(df["gap_snippet"].sum()),
-    }
-    print("\n    Gap type breakdown:")
-    for gtype, cnt in gap_counts.items():
-        pct = cnt / len(df) * 100
-        bar = "█" * min(30, int(pct / 2))
-        print(f"      {gtype:<15} {cnt:>5}  ({pct:5.1f}%)  {bar}")
-
-    return df
-
-    df["paa_questions"] = df[paa_cols].apply(
-        lambda row: " | ".join(
-            str(v) for v in row if pd.notna(v) and str(v).strip()
-        ), axis=1
-    ) if paa_cols else ""
-
-    df["gap_paa"] = has_paa & (df["position"] > 10)
-
-    # ── Snippet gap: featured snippet exists but we don't own it
-    if "snippet" in df.columns:
-        df["gap_snippet"] = (
-            df["snippet"].notna() &
-            (df["snippet"].astype(str).str.strip() != "") &
-            (df["position"] > 5)
-        )
-    else:
-        df["gap_snippet"] = False
-
-    # ── Composite gap score (weighted)
-    # Absence weighted highest — no presence at all is the biggest gap
-    weights = {
-        "gap_absence":     0.40,
-        "gap_performance": 0.30,
-        "gap_format":      0.15,
-        "gap_paa":         0.10,
-        "gap_snippet":     0.05,
-    }
-    df["gap_score"] = sum(
-        df[col].astype(float) * w for col, w in weights.items()
-    ).round(3)
-
-    # ── Gap type label (primary gap for quick reading)
-    def primary_gap(row):
-        if row["gap_absence"]:     return "Absence"
-        if row["gap_performance"]: return "Performance"
-        if row["gap_format"]:      return "Format"
-        if row["gap_paa"]:         return "PAA"
-        if row["gap_snippet"]:     return "Snippet"
-        return "None"
-
-    df["primary_gap"] = df.apply(primary_gap, axis=1)
-
-    # ── Summary stats
-    gap_counts = {
-        "Absence":     df["gap_absence"].sum(),
-        "Performance": df["gap_performance"].sum(),
-        "Format":      df["gap_format"].sum(),
-        "PAA":         df["gap_paa"].sum(),
-        "Snippet":     df["gap_snippet"].sum(),
     }
     print("\n    Gap type breakdown:")
     for gtype, cnt in gap_counts.items():
@@ -2553,101 +2657,64 @@ def _extract_topic_phrase(keywords: list[str]) -> str:
 
 def _generate_title(topic: str, paa_questions: list[str], primary_gap: str,
                     content_type: str, research_area: str,
-                    top_keywords: list[str], used_titles: set) -> str:
+                    top_keywords: list[str], used_titles: set,
+                    rep_titles: list[str] = None) -> str:
     """
-    Generate a specific, non-repetitive title using multiple strategies:
-    1. PAA-first: turn the most specific PAA question into a title
-    2. Mechanism: "X: Mechanisms, Regulation & [Research|Clinical] Implications"
-    3. Comparative: "X vs Y: ..."
-    4. Application: how/why/what structure based on top keywords
-    Tracks used titles to avoid repetition.
+    Derive a suggested article title from actual SERP evidence.
+
+    The title is NOT invented from templates or PAA questions.
+    It is extracted/synthesised from the real titles that are already ranking
+    in the SERP for this keyword cluster — so it reflects what Google is
+    actually rewarding for this topic.
+
+    Strategy (in priority order):
+    1. Best rep_title — the most centroid-representative actual SERP title,
+       stripped of publisher suffix/boilerplate (already cleaned by _clean_title)
+    2. _extract_cluster_theme on rep_titles — if the best single title is too
+       generic or already used, extract the shared phrase across the top titles
+    3. Structured fallback — topic + content_type signal, no generic templates
+
+    PAA questions are NEVER used as titles. They belong in paa_questions column.
     """
-    area = research_area.split("/")[0].strip()
+    area        = research_area.split("/")[0].strip()
     topic_title = topic.title()
 
-    # ── Strategy 1: PAA-first (most specific, reader-intent driven)
-    if paa_questions:
-        # Prefer questions that contain specific scientific terms
-        specific_qs = [
-            q for q in paa_questions
-            if len(q.split()) >= 5
-            and not any(g in q.lower() for g in ["what is", "what are", "define"])
-        ]
-        generic_qs = [q for q in paa_questions if q not in specific_qs]
+    # ── Strategy 1: best real SERP title from the cluster
+    if rep_titles:
+        for t in rep_titles:
+            t_clean = _clean_title(t)
+            if not t_clean:
+                continue
+            if t_clean not in used_titles and len(t_clean) > 15:
+                used_titles.add(t_clean)
+                return t_clean
 
-        for q in (specific_qs + generic_qs)[:5]:
-            q_clean = q.strip().rstrip("?")
-            if len(q_clean) > 20:
-                candidate = f"{q_clean}"
-                if candidate not in used_titles:
-                    used_titles.add(candidate)
-                    return candidate
+    # ── Strategy 2: shared theme across cluster titles
+    if rep_titles and len(rep_titles) >= 2:
+        theme = _extract_cluster_theme(rep_titles)
+        if theme and theme not in used_titles and len(theme) > 10:
+            used_titles.add(theme)
+            return theme
 
-    # ── Strategy 2: detect comparative angle from keywords
-    comparators = [k for k in top_keywords[:10]
-                   if " vs " in k.lower() or " versus " in k.lower()]
-    if comparators and primary_gap in ("Absence", "Performance"):
-        parts = re.split(r" vs | versus ", comparators[0], flags=re.IGNORECASE)
-        if len(parts) == 2:
-            candidate = f"{parts[0].strip().title()} vs {parts[1].strip().title()}: Mechanisms, Efficacy & Clinical Considerations"
-            if candidate not in used_titles:
-                used_titles.add(candidate)
-                return candidate
+    # ── Strategy 3: structured fallback based on gap type
+    # Only reached if rep_titles is empty (keyword-only clusters with no SERP data)
+    # Uses content_type to pick the right angle — still grounded in data signal.
+    gap_angles = {
+        "Absence":     f"{topic_title}: {area} Research Overview",
+        "Performance": f"{topic_title}: Updated Analysis for {area}",
+        "PAA":         f"{topic_title}: Key Questions in {area}",
+        "Format":      f"{topic_title}: {content_type} for {area}",
+    }
+    candidate = gap_angles.get(primary_gap, f"{topic_title}: {area} Perspective")
+    if candidate not in used_titles:
+        used_titles.add(candidate)
+        return candidate
 
-    # ── Strategy 3: mechanism/pathway angle (best for absence gaps in research areas)
-    if primary_gap == "Absence":
-        templates = [
-            f"{topic_title}: Mechanisms, Regulation and Therapeutic Implications",
-            f"{topic_title}: From Molecular Biology to Clinical Applications",
-            f"The Role of {topic_title} in {area}: Current Research and Emerging Insights",
-            f"{topic_title}: Pathways, Biomarkers and Research Advances",
-        ]
-        for t in templates:
-            if t not in used_titles:
-                used_titles.add(t)
-                return t
-
-    # ── Strategy 4: performance gap — content exists but underperforms
-    if primary_gap == "Performance":
-        templates = [
-            f"{topic_title}: What Researchers Need to Know in {_current_year()}",
-            f"Advances in {topic_title}: Key Findings and Clinical Relevance",
-            f"{topic_title} Explained: Mechanisms, Methods and Current Evidence",
-        ]
-        for t in templates:
-            if t not in used_titles:
-                used_titles.add(t)
-                return t
-
-    # ── Strategy 5: PAA gap — question-led content
-    if primary_gap == "PAA" and paa_questions:
-        q = paa_questions[0].strip().rstrip("?")
-        templates = [
-            f"{q}: A Researcher's Guide",
-            f"{topic_title}: Answering the Key Questions in {area}",
-        ]
-        for t in templates:
-            if t not in used_titles:
-                used_titles.add(t)
-                return t
-
-    # ── Strategy 6: format gap — accessible explainer
-    if primary_gap == "Format":
-        templates = [
-            f"{topic_title}: A Practical Guide for {area} Research",
-            f"Understanding {topic_title}: Key Concepts and Applications",
-        ]
-        for t in templates:
-            if t not in used_titles:
-                used_titles.add(t)
-                return t
-
-    # ── Fallback with uniqueness guarantee
-    fallback = f"{topic_title}"
+    # ── Last resort: topic with uniqueness suffix
+    fallback = topic_title
     suffix   = 2
-    base     = fallback
     while fallback in used_titles:
-        fallback = f"{base} (Part {suffix})"
+        fallback = f"{topic_title} ({suffix})"
         suffix  += 1
     used_titles.add(fallback)
     return fallback
@@ -2676,46 +2743,83 @@ def _wordcount(fmt: str, academic_lock: float) -> str:
 def _recommend_structure(paa_questions: list[str], content_type: str,
                           top_keywords: list[str]) -> str:
     """
-    Suggest an article structure (H2 sections) based on PAA questions,
-    content type, and keyword themes. This is the core of what makes
-    a brief actually useful to a writer.
+    Derive article H2 structure from actual evidence — PAA questions and
+    keyword themes — rather than hardcoded content-type templates.
+
+    Logic:
+    1. PAA questions (already relevance-gated) become the core H2s.
+       They represent real questions Google users are asking about this topic.
+    2. Gaps in coverage are filled from keyword themes: if the top keywords
+       suggest a mechanism, clinical, or methods angle not covered by PAA,
+       add it as a section.
+    3. A minimal frame (intro + conclusion) is added around the evidence-based
+       sections. These are the only templated parts.
+
+    Result: every brief has a unique structure driven by its actual data,
+    not a generic 'Clinical Deep-Dive' template applied identically to
+    every immunotherapy article.
     """
-    sections = []
+    sections = ["Introduction & Overview"]
 
-    # Always open with an intro section
-    sections.append("Introduction & Why This Topic Matters")
+    # ── Core sections from PAA questions (clean the question into an H2)
+    paa_sections = []
+    for q in paa_questions[:5]:
+        q = q.strip().rstrip("?")
+        if not q or len(q) < 10:
+            continue
+        # Capitalise as a heading
+        paa_sections.append(q[0].upper() + q[1:])
 
-    # If we have PAA questions, use them as H2s
-    if paa_questions:
-        for q in paa_questions[:4]:
-            q = q.strip().rstrip("?")
-            if q and len(q) > 10:
-                sections.append(q)
+    sections.extend(paa_sections)
 
-    # Pad with inferred sections based on content type
-    if content_type == "Clinical Deep-Dive":
-        extras = ["Molecular Mechanisms", "Clinical Evidence & Trial Data",
-                  "Biomarkers & Patient Selection", "Current Challenges & Future Directions"]
-    elif content_type == "Practical Guide":
-        extras = ["Key Principles & Background", "Step-by-Step Methodology",
-                  "Troubleshooting & Best Practices", "Applications & Case Examples"]
-    elif content_type == "Educational Overview":
-        extras = ["Core Concepts & Definitions", "Biological Mechanisms",
-                  "Research Applications", "Open Questions in the Field"]
-    elif content_type == "Comparative Analysis":
-        extras = ["Mechanism of Action Comparison", "Clinical / Experimental Evidence",
-                  "Advantages & Limitations", "How to Choose: Decision Framework"]
-    else:
-        extras = ["Background & Context", "Key Research Findings",
-                  "Implications for Research & Practice", "Conclusion & Future Outlook"]
+    # ── Fill remaining slots from keyword themes
+    # Extract the most specific 2-3 word phrases from top_keywords to infer
+    # angles the PAA questions haven't already covered.
+    n_slots = max(0, 5 - len(paa_sections))
+    if n_slots > 0 and top_keywords:
+        # Group keywords by shared first meaningful word → infer angle
+        angle_candidates = []
+        kw_stop = {"the","a","an","of","in","and","or","for","with","is","are",
+                   "how","what","why","when","does","do","can","will"}
+        seen_first = set()
+        for kw in top_keywords[:20]:
+            words = [w for w in kw.lower().split() if w not in kw_stop and len(w) > 3]
+            if not words:
+                continue
+            first = words[0]
+            if first in seen_first:
+                continue
+            seen_first.add(first)
+            # Build a heading from the 2-3 most informative words
+            heading_words = words[:3]
+            heading = " ".join(heading_words).title()
+            # Only add if not already covered by a PAA section
+            if not any(heading.lower() in s.lower() for s in paa_sections):
+                angle_candidates.append(heading)
+            if len(angle_candidates) >= n_slots:
+                break
 
-    for e in extras:
-        if e not in sections and len(sections) < 7:
-            sections.append(e)
+        sections.extend(angle_candidates[:n_slots])
 
-    sections.append("Conclusion & Key Takeaways")
+    # ── Clinical/methods framing based on content type — only if no PAA covers it
+    paa_text = " ".join(paa_sections).lower()
+    if content_type == "Clinical Deep-Dive" and "clinical" not in paa_text:
+        sections.append("Clinical Evidence & Current Guidelines")
+    elif content_type == "Practical Guide" and "method" not in paa_text:
+        sections.append("Methods, Protocols & Best Practices")
 
-    return " → ".join(sections)
+    sections.append("Key Takeaways & Future Directions")
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique_sections = []
+    for s in sections:
+        key = s.lower()[:30]
+        if key not in seen:
+            seen.add(key)
+            unique_sections.append(s)
+
+    return " → ".join(unique_sections[:7])
 
 
 def _cluster_relevance_score(text: str, area_emb: np.ndarray, model) -> float:
@@ -2792,9 +2896,16 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
     """
     print("\n[9] Generating content briefs...")
 
-    from sklearn.decomposition import TruncatedSVD
-    from sklearn.cluster import AgglomerativeClustering, KMeans
     from sklearn.preprocessing import normalize
+
+    try:
+        import umap as _umap; _HAVE_UMAP = True
+    except ImportError:
+        _HAVE_UMAP = False
+    try:
+        import hdbscan as _hdbscan; _HAVE_HDBSCAN = True
+    except ImportError:
+        _HAVE_HDBSCAN = False
 
     # Only classified, meaningfully gapped keywords
     work = df[
@@ -2825,22 +2936,26 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         if len(area_df) < 3:
             continue
 
-        # ── Cluster within this area only
+        # ── Reduce + cluster within this area
         area_indices = area_df.index.tolist()
         a_emb        = kw_emb[area_indices]
         n            = len(area_df)
-        n_comp       = min(30, a_emb.shape[1] - 1, n - 1)
-        reduced      = normalize(
-            TruncatedSVD(n_components=n_comp, random_state=42).fit_transform(a_emb)
-        )
 
-        k = max(2, min(15, n // 6))
-        labels = (
-            AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average")
-            .fit_predict(reduced)
-            if n <= 500 else
-            KMeans(n_clusters=k, random_state=42, n_init="auto").fit_predict(reduced)
-        )
+        reduced = _reduce_embeddings(a_emb, n_components=min(10, n-2),
+                                     have_umap=_HAVE_UMAP)
+        labels  = _cluster_embeddings(reduced, min_size=2,
+                                      have_hdbscan=_HAVE_HDBSCAN)
+
+        # Assign noise points to nearest cluster
+        if -1 in labels:
+            from sklearn.metrics import pairwise_distances_argmin_min
+            noise_mask = labels == -1
+            valid_mask = labels != -1
+            if valid_mask.sum() > 0:
+                nearest, _ = pairwise_distances_argmin_min(
+                    reduced[noise_mask], reduced[valid_mask]
+                )
+                labels[noise_mask] = labels[valid_mask][nearest]
 
         area_df = area_df.copy()
         area_df["area_cluster"] = labels
@@ -2878,18 +2993,26 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             top_gap   = cluster["primary_gap"].value_counts().index[0] \
                         if len(cluster["primary_gap"].value_counts()) else "Absence"
 
-            # ── PAA questions — deduplicated locally AND globally
-            # Global dedup: same PAA question appearing in multiple briefs
-            # confuses writers — each question should belong to one brief.
+            # ── PAA questions — deduplicated locally AND globally, relevance-gated
+            # PAA questions come from raw SERP data and frequently contain off-topic
+            # questions that happen to co-occur with life science keywords.
+            # Junk pattern and relevance gate are applied before adding to all_paa.
             all_paa = []
             for paa_str in cluster["paa_questions"].dropna():
                 for q in str(paa_str).split("|"):
                     q = q.strip()
+                    if not q or len(q) <= 10:
+                        continue
                     norm_q = _normalise_for_dedup(q)
-                    if (q and len(q) > 10
-                            and q not in all_paa
-                            and norm_q not in used_paa):
-                        all_paa.append(q)
+                    if norm_q in used_paa or q in all_paa:
+                        continue
+                    # Hard pattern block — biographical/crime junk
+                    if _JUNK_PAA_PATTERNS.search(q):
+                        continue
+                    # Semantic relevance gate — question must relate to life science
+                    if not _is_relevant(q, area_emb, model):
+                        continue
+                    all_paa.append(q)
             # Register these PAAs as used globally
             for q in all_paa:
                 used_paa.add(_normalise_for_dedup(q))
@@ -2899,20 +3022,70 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
             dom_fmt      = fmt_counts.index[0] if len(fmt_counts) else "other"
             content_type = CONTENT_TYPE_MAP.get(dom_fmt, "Research Article")
 
-            # ── Target keywords: valid only, sorted by impressions
-            if "impressions" in cluster.columns and cluster["impressions"].sum() > 0:
+            # ── Target keywords: scored by relevance to cluster topic,
+            # not just impressions. A keyword that's semantically central
+            # to this cluster AND has high impressions AND has a real gap
+            # is far more valuable than a high-impression keyword that's
+            # only loosely related to the cluster theme.
+            #
+            # Score = semantic_centrality × demand_weight × gap_weight
+            #   semantic_centrality: cosine similarity of keyword embedding
+            #                        to cluster centroid (0-1)
+            #   demand_weight:       log-normalised impressions (0-1)
+            #   gap_weight:          gap_score (0-1, already impression-weighted)
+            #
+            # This ensures the primary_keyword and secondary_keywords in the
+            # brief are the ones the article should actually target — not just
+            # whatever happened to rank highest in GSC.
+
+            c_emb_norm   = c_emb / (np.linalg.norm(c_emb, axis=1, keepdims=True) + 1e-9)
+            centroid_norm = centroid / (np.linalg.norm(centroid) + 1e-9)
+            centrality    = (c_emb_norm @ centroid_norm).clip(0, 1)
+
+            kw_df = cluster[cluster["keyword"].apply(_is_valid_label)].copy()
+            kw_df = kw_df.reset_index(drop=True)
+
+            if len(kw_df) == 0:
+                top_kws = valid_kws[:15]
+            else:
+                # Re-index centrality to match kw_df rows
+                valid_mask = cluster["keyword"].apply(_is_valid_label).values
+                cent_valid = centrality[valid_mask]
+
+                max_imp = kw_df["impressions"].max() if kw_df["impressions"].max() > 0 else 1
+                demand  = np.log1p(kw_df["impressions"].values) / np.log1p(max_imp)
+                gap_w   = kw_df["gap_score"].values.clip(0, 1)
+
+                kw_score = cent_valid * 0.45 + demand * 0.35 + gap_w * 0.20
+
+                kw_df["_kw_score"] = kw_score
                 top_kws = (
-                    cluster[cluster["keyword"].apply(_is_valid_label)]
-                    .sort_values("impressions", ascending=False)
+                    kw_df.sort_values("_kw_score", ascending=False)
                     ["keyword"].head(15).tolist()
                 )
-            else:
-                top_kws = valid_kws[:15]
 
-            # ── Generate non-repetitive title
+            # ── Representative SERP titles for this cluster
+            # Pull from cluster_labels (all title clusters spanning these keywords)
+            # — these are real SERP titles already cleaned by Stage 5.
+            # Used as the primary source for suggested_title.
+            rep_titles_raw = []
+            for label_str in cluster["cluster_labels"].dropna():
+                for lbl in str(label_str).split("||"):
+                    lbl = lbl.strip()
+                    if lbl and lbl not in rep_titles_raw and lbl != "No title data":
+                        rep_titles_raw.append(lbl)
+            # Also add primary_cluster_label for each keyword
+            for lbl in cluster["primary_cluster_label"].dropna().unique():
+                if lbl and lbl not in rep_titles_raw and lbl != "No title data":
+                    rep_titles_raw.append(lbl)
+            # Deduplicate and take top 6 most distinct
+            rep_titles = list(dict.fromkeys(rep_titles_raw))[:6]
+
+            # ── Generate title from SERP evidence
             title = _generate_title(
                 topic, all_paa, top_gap, content_type,
-                area, top_kws, used_titles
+                area, top_kws, used_titles,
+                rep_titles=rep_titles
             )
 
             # ── Suggested article structure
@@ -2929,6 +3102,7 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
                 "tier":                tier_lookup.get(area, 2),
                 "topic":               topic,
                 "suggested_title":     title,
+                "serp_evidence":       " | ".join(rep_titles[:3]),
                 "content_type":        content_type,
                 "primary_gap":         top_gap,
                 "keyword_count":       len(cluster),
@@ -3627,62 +3801,111 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
 # 11. SEARCH INTENT CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════════
 
-INTENT_PATTERNS = {
-    "informational": [
-        r"\b(what is|what are|how does|how do|why does|why is|explain|"
-        r"mechanism|overview|introduction|definition|understand|learn|"
-        r"review|guide|tutorial|biology|pathway|function|role of)\b"
-    ],
-    "commercial": [
-        r"\b(best|top|compare|vs\.?|versus|comparison|alternative|"
-        r"recommend|rated|ranking|review of|which is better|choose)\b"
-    ],
-    "transactional": [
-        r"\b(buy|purchase|order|price|cost|kit|panel|reagent|antibody|"
-        r"catalog|supplier|manufacturer|protocol kit|assay kit|"
-        r"recombinant|conjugated|custom)\b"
-    ],
-    "clinical": [
-        r"\b(clinical trial|phase [123]|patient|treatment|therapy|"
-        r"diagnosis|prognosis|biomarker|efficacy|safety|dose|dosing|"
-        r"indication|fda approved|ema approved|guideline|standard of care)\b"
-    ],
-    "navigational": [
-        r"\b(ncbi|pubmed|uniprot|ensembl|pdb|kegg|reactome|"
-        r"abcam|thermo|sigma|bio-techne|r&d systems|biolegend)\b"
-    ],
+# Intent classification via embedding similarity — more accurate than regex
+# for biomedical text where the same terms appear across intent types.
+# Each prototype is a short sentence capturing the essential character of that intent.
+# At startup, embed_intent_prototypes() encodes these and stores the matrix.
+INTENT_PROTOTYPES = {
+    "informational": (
+        "how does this biological mechanism work, what is the pathway, "
+        "explain the molecular function, review of the science, "
+        "overview of the research, what role does this gene play"
+    ),
+    "clinical": (
+        "clinical trial results, patient treatment outcomes, therapy efficacy, "
+        "phase 2 phase 3 study, standard of care, diagnosis prognosis biomarker, "
+        "FDA approved indication, dosing regimen, safety adverse events"
+    ),
+    "commercial": (
+        "compare products, best antibody kit for this assay, "
+        "which reagent is better, top rated alternatives, "
+        "versus comparison, which should I choose"
+    ),
+    "transactional": (
+        "buy reagent antibody kit, order catalog, price cost, "
+        "recombinant protein supplier, assay kit manufacturer, custom conjugated"
+    ),
+    "navigational": (
+        "NCBI PubMed database, UniProt entry, Ensembl gene page, "
+        "KEGG pathway map, Reactome, protein data bank PDB entry"
+    ),
 }
 
-def classify_intent(text: str) -> str:
-    """Classify search intent from keyword or title text."""
-    text = text.lower()
-    scores = {}
-    for intent, patterns in INTENT_PATTERNS.items():
-        score = sum(len(re.findall(p, text)) for p in patterns)
-        scores[intent] = score
-    top = max(scores, key=scores.get)
-    return top if scores[top] > 0 else "informational"
+# Will be populated by embed_intent_prototypes() at runtime
+_INTENT_PROTOTYPE_MATRIX = None   # shape (5, embedding_dim)
+_INTENT_LABELS            = list(INTENT_PROTOTYPES.keys())
 
 
-def run_intent_classification(df: pd.DataFrame) -> pd.DataFrame:
+def embed_intent_prototypes(model) -> None:
+    """Encode intent prototypes once after model is loaded."""
+    global _INTENT_PROTOTYPE_MATRIX
+    texts = [INTENT_PROTOTYPES[k] for k in _INTENT_LABELS]
+    _INTENT_PROTOTYPE_MATRIX = model.encode(
+        texts, normalize_embeddings=True, show_progress_bar=False
+    )
+
+def classify_intent(text: str, model=None) -> str:
+    """
+    Classify search intent using embedding similarity to intent prototypes.
+    Falls back to regex if model/prototypes not yet initialised.
+
+    Embedding approach is significantly more accurate for biomedical text:
+    - "KRAS G12C expression colorectal cancer prognosis" → clinical (not informational)
+    - "sotorasib resistance mechanism" → informational (not transactional)
+    - Regex would misclassify both of these.
+    """
+    # Fast navigational pre-filter — these are unambiguous by keyword alone
+    _NAV_RE = re.compile(
+        r'\b(ncbi|pubmed|uniprot|ensembl|pdb|kegg|reactome|'
+        r'abcam|thermo|sigma|bio-techne|r&d systems|biolegend)\b',
+        re.IGNORECASE
+    )
+    if _NAV_RE.search(text):
+        return "navigational"
+
+    # Embedding-based classification
+    if _INTENT_PROTOTYPE_MATRIX is not None and model is not None:
+        vec  = model.encode(text, normalize_embeddings=True, show_progress_bar=False)
+        sims = _INTENT_PROTOTYPE_MATRIX @ vec
+        return _INTENT_LABELS[int(sims.argmax())]
+
+    # Regex fallback if prototypes not initialised
+    _FALLBACK = {
+        "transactional": re.compile(
+            r'\b(buy|purchase|order|price|cost|kit|reagent|antibody|'
+            r'catalog|supplier|manufacturer|recombinant|conjugated)\b', re.I),
+        "commercial":    re.compile(
+            r'\b(best|top|compare|vs\.?|versus|alternative|which is better)\b', re.I),
+        "clinical":      re.compile(
+            r'\b(clinical trial|phase [123]|patient|treatment|therapy|'
+            r'efficacy|safety|fda approved|standard of care)\b', re.I),
+        "informational": re.compile(
+            r'\b(what is|how does|mechanism|overview|pathway|function|review)\b', re.I),
+    }
+    for intent, pat in _FALLBACK.items():
+        if pat.search(text):
+            return intent
+    return "informational"
+
+
+def run_intent_classification(df: pd.DataFrame, model=None) -> pd.DataFrame:
     """
     Stage 11: Classify search intent for every keyword.
-
-    Why this matters for page 1-2 visibility:
-    If your content is informational but the SERP is 80% transactional,
-    Google will not rank you there regardless of content quality.
-    This flags those structural mismatches so you don't waste resource.
-
-    Outputs:
-      keyword_intent    — dominant intent of the search query
-      serp_intent       — dominant intent of top-ranking titles
-      intent_mismatch   — True if keyword and SERP intents diverge
-      intent_note       — human-readable explanation of the mismatch
+    Uses embedding similarity to intent prototypes when model is available.
     """
     print("\n[11] Classifying search intent...")
 
+    # Initialise intent prototypes with the shared model
+    if model is not None:
+        embed_intent_prototypes(model)
+        print("    → Using embedding-based intent classification")
+    else:
+        print("    → Using regex fallback for intent classification")
+
     # Classify keyword intent
-    df["keyword_intent"] = df["keyword"].apply(classify_intent)
+    df["keyword_intent"] = df["keyword"].apply(
+        lambda t: classify_intent(t, model=model)
+    )
 
     # Classify SERP intent from titles
     title_cols = sorted([c for c in df.columns if re.match(r"title_\d+", c)])
@@ -3694,7 +3917,7 @@ def run_intent_classification(df: pd.DataFrame) -> pd.DataFrame:
         )
         if "enriched_text" in row.index and "|" in str(row.get("enriched_text", "")):
             titles = " ".join(str(row["enriched_text"]).split("|")[1:6])
-        return classify_intent(titles) if titles.strip() else "unknown"
+        return classify_intent(titles, model=model) if titles.strip() else "unknown"
 
     df["serp_intent"] = df.apply(serp_intent_from_titles, axis=1)
 
@@ -4377,7 +4600,7 @@ def main():
     )
 
     # ── Stage 11: Search intent classification
-    df = run_intent_classification(df)
+    df = run_intent_classification(df, model=model)
 
     # ── Stage 12: Page 2 fast wins
     wins_df = find_page2_fast_wins(df, args.output)
