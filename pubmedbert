@@ -669,6 +669,130 @@ def load_input(input_path: str, kw_col: str = "keyword") -> pd.DataFrame:
     return df
 
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# TITLE & ENRICHED TEXT CLEANING
+# ═══════════════════════════════════════════════════════════════════════
+
+# Publisher / site name suffixes stripped from SERP titles
+_PUBLISHER_SUFFIXES = re.compile(
+    r'[\s|\-–—]+'
+    r'(?:'
+    r'new\s+england\s+journal\s+of\s+medicine|'
+    r'new\s+engl\s+j\s+med|'
+    r'clinical\s+cancer\s+research|'
+    r'nature\s+(?:communications?|medicine|methods|genetics|immunology|'
+    r'chemical\s+biology|cell\s+biology|reviews?\s+\w+)|'
+    r'cancer\s+(?:research|cell|discovery)|'
+    r'journal\s+of\s+(?:clinical\s+oncology|immunology|biological\s+chemistry|'
+    r'experimental\s+medicine|cell\s+biology|\w+)|'
+    r'annals\s+of\s+(?:oncology|internal\s+medicine|\w+)|'
+    r'frontiers\s+in\s+\w+(?:\s+\w+)?|'
+    r'cell\s+(?:reports|stem\s+cell|metabolism|host\s+microbe)|'
+    r'nature|science(?:direct)?|lancet|nejm|jama|bmj|'
+    r'pubmed|ncbi|nih|nci|fda|cdc|who|ema|'
+    r'wikipedia|wikimedia|mayo\s+clinic|cleveland\s+clinic|'
+    r'springer|elsevier|wiley|oxford|cambridge|'
+    r'sciencedirect|researchgate|academia\.edu'
+    r')$',
+    re.IGNORECASE,
+)
+
+_BOILERPLATE = re.compile(
+    r'(?:full\s+text|free\s+full\s+text|pmc\s+free\s+article|'
+    r'epub\s+ahead\s+of\s+print|ahead\s+of\s+print|'
+    r'review\s+article|original\s+article|case\s+report|'
+    r'\[\s*pmc\s+free\s+article\s*\]|\[\s*free\s+article\s*\])',
+    re.IGNORECASE,
+)
+
+_ENCODING_ARTIFACTS = re.compile(
+    r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|'   # control chars
+    r'(?:&#\d+;|&[a-z]+;)',                   # HTML entities not yet decoded
+    re.IGNORECASE,
+)
+
+_HTML_ENTITY_MAP = {
+    '&amp;': '&', '&lt;': '<', '&gt;': '>',
+    '&quot;': '"', '&#39;': "'", '&nbsp;': ' ',
+    '&ndash;': '–', '&mdash;': '—',
+}
+_HTML_ENTITIES = re.compile('|'.join(re.escape(k) for k in _HTML_ENTITY_MAP))
+
+
+def _clean_title(text: str):
+    """Clean a single SERP title. Returns None if nothing useful remains."""
+    if not text or not isinstance(text, str):
+        return None
+    # Decode HTML entities
+    text = _HTML_ENTITIES.sub(lambda m: _HTML_ENTITY_MAP.get(m.group(0), ''), text)
+    # Remove encoding artifacts
+    text = _ENCODING_ARTIFACTS.sub('', text).strip()
+    # Strip publisher suffixes
+    text = _PUBLISHER_SUFFIXES.sub('', text).strip()
+    # Strip boilerplate phrases
+    text = _BOILERPLATE.sub('', text).strip()
+    # Normalise whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Discard very short fragments
+    if len(text) < 10:
+        return None
+    return text
+
+
+def _normalise_for_dedup(text: str) -> str:
+    """Normalise text for near-duplicate detection."""
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def _char_trigram_sim(a: str, b: str) -> float:
+    """Character trigram similarity between two strings."""
+    def trigrams(s):
+        s = s.lower()
+        return {s[i:i+3] for i in range(len(s) - 2)}
+    ta, tb = trigrams(a), trigrams(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _token_overlap(a: str, b: str) -> float:
+    """Jaccard similarity on word token sets."""
+    ta = set(a.lower().split())
+    tb = set(b.lower().split())
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _clean_enriched_text(text: str, keyword: str = '') -> str:
+    """
+    Clean a pipe-joined enriched_text string (from BigQuery string_agg).
+    Splits on |, cleans each segment, deduplicates near-identical segments,
+    re-joins with |.
+    """
+    if not text or not isinstance(text, str):
+        return keyword
+    segments = [s.strip() for s in text.split('|')]
+    cleaned = []
+    seen_norms = []
+    for seg in segments:
+        c = _clean_title(seg)
+        if not c:
+            continue
+        norm = _normalise_for_dedup(c)
+        # Skip near-duplicates (>0.85 trigram similarity to any kept segment)
+        if any(_char_trigram_sim(norm, s) > 0.85 for s in seen_norms):
+            continue
+        seen_norms.append(norm)
+        cleaned.append(c)
+    result = ' | '.join(cleaned)
+    return result if result else keyword
+
+
 def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
     """
     Two modes depending on what your SERP CSV contains:
