@@ -727,6 +727,20 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
     df = df.drop_duplicates("keyword").reset_index(drop=True)
 
     # ── 9. Coerce numeric columns
+    # Diagnose impressions BEFORE coercion — shows exactly what's in the raw file
+    if "impressions" in df.columns:
+        raw_imp = df["impressions"]
+        n_null    = raw_imp.isna().sum()
+        n_zero    = (raw_imp == "0").sum()
+        n_empty   = (raw_imp == "").sum()
+        n_nonzero = raw_imp.apply(lambda x: str(x).strip() not in ("", "0", "nan", "None")).sum()
+        print(f"\n    Raw impressions diagnostic (before coercion):")
+        print(f"      non-zero values : {n_nonzero:,}")
+        print(f"      null/NaN        : {n_null:,}")
+        print(f"      literal '0'     : {n_zero:,}")
+        print(f"      empty string    : {n_empty:,}")
+        print(f"      sample values   : {raw_imp.head(10).tolist()}")
+
     for col, default in [("impressions", 0), ("clicks", 0),
                           ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
         if col in df.columns:
