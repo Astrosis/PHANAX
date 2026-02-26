@@ -402,13 +402,12 @@ FORMAT_SIGNALS = {
 
 def parse_args():
     p = argparse.ArgumentParser(description="Life Science Content Gap Analysis Pipeline")
-    p.add_argument("--keywords", required=True,
-                   help="CSV: keyword, [volume], [impressions], [clicks], [position]")
-    p.add_argument("--serp",     required=True,
-                   help="CSV: keyword, title_1..3, [paa_1..3], [snippet]")
+    p.add_argument("--input", required=True,
+                   help="Single pre-joined CSV with all columns: keyword, impressions, "
+                        "clicks, position, title_1..3, [paa_1..3], [snippet]")
     p.add_argument("--output",   default="./output")
     p.add_argument("--kw-col",   default="keyword",
-                   help="Keyword column name in keywords CSV (default: 'keyword')")
+                   help="Keyword column name (default: 'keyword')")
     p.add_argument("--threshold", type=float, default=0.20,
                    help="Min cosine sim to assign research area (default: 0.20)")
     p.add_argument("--min-cluster", type=int, default=3,
@@ -625,27 +624,23 @@ def apply_keyword_filter(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame
     return kept
 
 
-def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
-    print("\n[1/10] Loading and merging inputs...")
+def load_input(input_path: str, kw_col: str = "keyword") -> pd.DataFrame:
+    print("\n[1/10] Loading input file...")
 
-    # Step 1: load both CSVs as-is
-    kw   = pd.read_csv(kw_path)
-    serp = pd.read_csv(serp_path)
+    df = pd.read_csv(input_path)
 
-    # Step 2: merge immediately — nothing else happens first
-    df = pd.merge(kw, serp, on=kw_col, how="left")
-
-    print(f"    → {len(kw):,} kw rows | {len(serp):,} SERP rows | {len(df):,} after merge")
-
-    # Step 3: standardise column names
+    # Normalise column names
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Step 4: rename keyword column if needed
+    # Rename keyword column if needed
     kw_col_norm = kw_col.strip().lower().replace(" ", "_")
     if kw_col_norm != "keyword" and kw_col_norm in df.columns:
         df = df.rename(columns={kw_col_norm: "keyword"})
 
-    # Step 5: coerce numeric columns
+    if "keyword" not in df.columns:
+        raise ValueError(f"Keyword column not found. Columns: {list(df.columns)}")
+
+    # Coerce numeric columns — position defaults to 999 (not provided in input)
     for col, default in [("impressions", 0), ("clicks", 0),
                           ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
         if col in df.columns:
@@ -653,304 +648,25 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         else:
             df[col] = default
 
-    # Step 6: normalise keyword and apply filters
+    # Normalise keyword text
     df["keyword_raw"] = df["keyword"].copy()
     df["keyword"]     = df["keyword"].apply(_normalise_keyword)
     df = df.drop_duplicates("keyword").reset_index(drop=True)
 
-    print("    → Applying keyword filters...")
+    print(f"    \u2192 {len(df):,} rows loaded")
+    print(f"    \u2192 columns present: {list(df.columns)}")
+    print(f"    \u2192 {(df['impressions'] > 0).sum():,} with impressions > 0")
+    if "enriched_text" not in df.columns:
+        print("    \u26a0\ufe0f  WARNING: no enriched_text column found — embeddings will be keyword text only")
+    if "all_paa_questions" not in df.columns:
+        print("    \u26a0\ufe0f  WARNING: no all_paa_questions column — PAA gap analysis disabled")
+
+    print("    \u2192 Applying keyword filters...")
     df = apply_keyword_filter(df, verbose=True)
-
-    with_imp  = (df["impressions"] > 0).sum()
-    with_serp = df["enriched_text"].notna().sum() if "enriched_text" in df.columns else \
-                df["title_1"].notna().sum() if "title_1" in df.columns else 0
-
-    print(f"    → {len(df):,} keywords after filter")
-    print(f"    → {with_imp:,} with impressions > 0")
-    print(f"    → {with_serp:,} with SERP data")
+    print(f"    \u2192 {len(df):,} keywords after filter | "
+          f"{(df['impressions'] > 0).sum():,} with impressions > 0")
 
     return df
-
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 2. ENRICH: keyword + SERP titles → embedding text
-# ═══════════════════════════════════════════════════════════════════════
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# TITLE & ENRICHED TEXT CLEANING
-# ═══════════════════════════════════════════════════════════════════════
-#
-# Two levels of cleaning, applied at different stages:
-#
-# _clean_title(text)
-#   Applied to every individual SERP title before it enters the
-#   title corpus (cluster_keywords Stage 5, mine_serp_title_gaps Stage 10).
-#   Strips publisher suffixes, boilerplate phrases, site names, encoding
-#   artifacts, and very short fragments. Returns None if nothing useful
-#   remains (caller should skip the title).
-#
-# _clean_enriched_text(text)
-#   Applied to the full pipe-joined enriched_text string in enrich_text()
-#   (Stage 2). Splits on pipe, cleans each segment individually with
-#   _clean_title, deduplicates near-identical segments, then re-joins.
-#   This is what controls keyword-level embedding quality.
-# ─────────────────────────────────────────────────────────────────────
-
-# Publisher / site name suffixes commonly appended to SERP titles.
-# Matched case-insensitively. Pattern: " - Publisher" or " | Publisher" at end.
-_PUBLISHER_SUFFIXES = re.compile(
-    r'[\s\|\-\u2013\u2014]+'
-    r'(?:'
-    # Exact multi-word publishers first (order matters — longer matches first)
-    r'new\s+england\s+journal\s+of\s+medicine|'
-    r'new\s+engl\s+j\s+med|'
-    r'clinical\s+cancer\s+research|'
-    r'nature\s+(?:communications?|medicine|methods|genetics|immunology|'
-    r'chemical\s+biology|cell\s+biology|reviews?\s+\w+)|'
-    r'cancer\s+(?:research|cell|discovery)|'
-    r'journal\s+of\s+(?:clinical\s+oncology|immunology|biological\s+chemistry|'
-    r'experimental\s+medicine|cell\s+biology|\w+)|'
-    r'annals\s+of\s+(?:oncology|internal\s+medicine|\w+)|'
-    r'frontiers\s+in\s+\w+(?:\s+\w+)?|'
-    r'cell\s+(?:reports|stem\s+cell|metabolism|host\s+microbe)|'
-    # Single-word publishers / institutions
-    r'nature|science(?:direct)?|lancet|nejm|jama|bmj|'
-    r'plos(?:\s+\w+)?|pnas|pubmed|ncbi|nih|nci|'
-    r'wiley(?:\s+online\s+library)?|springer(?:\s+link)?|elsevier|'
-    r'oxford(?:\s+academic)?|cambridge(?:\s+core)?|'
-    # Hospitals and centers
-    r'(?:mayo|cleveland)\s+clinic|'
-    r'(?:memorial\s+sloan\s+kettering|msk)\s+cancer\s+center|'
-    r'(?:md\s+anderson|dana.farber)\s+cancer\s+(?:center|institute)|'
-    r'(?:[\w\s]{3,30})\s+cancer\s+center|'
-    r'(?:[\w\s]{3,30})\s+medical\s+center|'
-    r'(?:[\w\s]{3,30})\s+university(?:\s+hospital)?|'
-    # General high-frequency sites
-    r'wikipedia|webmd|healthline|medscape|uptodate|'
-    r'verywellhealth|medicalnewstoday|drugs\.com|rxlist|emedicine|'
-    r'merck\s+manual[s]?|'
-    # Government/regulatory
-    r'ncbi\.nlm\.nih\.gov|nih\.gov|cdc\.gov|who\.int|fda\.gov|ema\.europa\.eu|'
-    # Generic "site.com" catch-all
-    r'(?:[\w\-]+\.(?:com|org|net|edu|gov|io))'
-    r')'
-    r'\s*$',
-    re.IGNORECASE,
-)
-
-# Boilerplate title suffixes that add no semantic content
-_BOILERPLATE_SUFFIXES = re.compile(
-    r'[\s\|\-\u2013\u2014:]*'
-    r'(?:'
-    r'(?:a\s+)?complete\s+guide|'
-    r'everything\s+you\s+need\s+to\s+know|'
-    r'(?:the\s+)?(?:ultimate|comprehensive|definitive|essential)\s+guide|'
-    r'what\s+you\s+need\s+to\s+know|'
-    r'all\s+you\s+need\s+to\s+know|'
-    r'updated?\s+(?:in\s+)?20\d\d|'
-    r'(?:last\s+)?updated\s+20\d\d|'
-    r'(?:new\s+in\s+)?20\d\d|'
-    # Only match "overview/review/summary" when preceded by at least one qualifier
-    r'(?:full\s+|complete\s+|detailed\s+|in.depth\s+)?'
-    r'(?:systematic\s+review|literature\s+review|narrative\s+review|'
-    r'scoping\s+review|research\s+overview|research\s+article|'
-    r'research\s+review|clinical\s+overview|clinical\s+review)|'
-    r'current\s+evidence\s+and\s+research\s+directions|'
-    r'evidence[,\s]+mechanisms?\s+and\s+research\s+implications|'
-    r'mechanisms?,?\s+current\s+evidence\s+and\s+research\s+directions|'
-    r'research\s+overview,?\s+methods?\s+and\s+key\s+findings|'
-    r'a\s+deep.dive\s+into\s+mechanisms?[,\s]+current\s+evidence[^$]*|'
-    r'read\s+more|learn\s+more|click\s+here|find\s+out\s+more|'
-    r'(?:free\s+)?(?:pdf|download)'
-    r')'
-    r'\s*$',
-    re.IGNORECASE,
-)
-
-# HTML entities
-_HTML_ENTITY_MAP = {
-    "&amp;": "&", "&lt;": "<", "&gt;": ">",
-    "&quot;": '"', "&apos;": "'", "&nbsp;": " ",
-}
-_HTML_ENTITIES = re.compile(r'&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9a-fA-F]+);')
-
-# URL pattern
-_URL_RE = re.compile(
-    r'https?://\S+|www\.\S+|\S+\.(?:com|org|net|edu|gov|io)/\S*',
-    re.IGNORECASE,
-)
-
-# Encoding artifacts: raw mojibake and hex escapes in string data
-_ENCODING_ARTIFACTS = re.compile(
-    r'â€[^\s]|'           # UTF-8 apostrophe mojibake (â€™ etc)
-    r'Ã[\x80-\xff]|'      # Latin-1 mojibake
-    r'\\x[0-9a-fA-F]{2}'  # literal \x84 style escapes
-)
-
-# Numeric-only or short catalog code strings
-_CODE_RE = re.compile(r'^(?:\d+|[a-z]{1,3}\d{3,}|[a-z0-9\-]{1,4})$', re.IGNORECASE)
-
-_MIN_SEGMENT_LEN = 12
-
-
-def _clean_title(text: str):
-    """
-    Clean a single SERP title for use in the title corpus.
-
-    Returns cleaned string, or None if nothing meaningful remains.
-
-    Steps:
-    1. Reject null/nan/empty literals
-    2. Decode HTML entities and fix encoding artifacts
-    3. Strip URLs
-    4. Strip publisher name suffixes (iteratively — can be stacked)
-    5. Strip boilerplate suffixes
-    6. Normalise whitespace
-    7. Return None if result is a catalog code or under _MIN_SEGMENT_LEN chars
-    """
-    if not text or not isinstance(text, str):
-        return None
-
-    t = text.strip()
-
-    if t.lower() in ("null", "nan", "none", "n/a", "na", "", "-"):
-        return None
-
-    # Decode HTML entities
-    def _entity_replace(m):
-        return _HTML_ENTITY_MAP.get(m.group(0), "")
-    t = _HTML_ENTITIES.sub(_entity_replace, t)
-
-    # Fix encoding artifacts
-    t = _ENCODING_ARTIFACTS.sub("", t)
-
-    # Strip URLs
-    t = _URL_RE.sub("", t).strip()
-
-    # Iteratively strip publisher suffixes (can be layered: "Title - NCI | PubMed")
-    for _ in range(4):
-        prev = t
-        t = _PUBLISHER_SUFFIXES.sub("", t).strip(" |-\u2013\u2014:")
-        if t == prev:
-            break
-
-    # Strip boilerplate suffixes
-    t = _BOILERPLATE_SUFFIXES.sub("", t).strip(" |-\u2013\u2014:")
-
-    # Normalise whitespace
-    t = re.sub(r'\s+', ' ', t).strip()
-
-    if not t or _CODE_RE.match(t) or len(t) < _MIN_SEGMENT_LEN:
-        return None
-
-    # Reject titles where a brand name appears as a full word —
-    # these are product/vendor pages, not useful content signals
-    t_lower = t.lower()
-    if any(
-        re.search(r'\b' + re.escape(term) + r'\b', t_lower)
-        for term in BRAND_TERMS
-        if len(term) > 4
-    ):
-        return None
-
-    return t
-
-
-def _normalise_for_dedup(text: str) -> str:
-    """Lowercase, strip punctuation, collapse spaces — for near-duplicate detection."""
-    t = text.lower()
-    t = re.sub(r'[^a-z0-9\s]', ' ', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
-
-
-def _char_trigram_sim(a: str, b: str) -> float:
-    """
-    Character trigram similarity — handles plurals, stemming variants,
-    minor rewordings better than word-level Jaccard.
-    Returns 0.0-1.0 (Dice coefficient on trigram sets).
-    """
-    def trigrams(s):
-        s = s.replace(" ", "_")  # treat spaces as char for boundary trigrams
-        return set(s[i:i+3] for i in range(len(s) - 2))
-    ta, tb = trigrams(a), trigrams(b)
-    if not ta or not tb:
-        return 0.0
-    return 2 * len(ta & tb) / (len(ta) + len(tb))
-
-
-def _token_overlap(a: str, b: str) -> float:
-    """Jaccard similarity on word token sets."""
-    sa = set(a.split())
-    sb = set(b.split())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def _clean_enriched_text(text: str, keyword: str) -> str:
-    """
-    Clean a full pipe-joined enriched_text string from BigQuery string_agg.
-
-    Steps:
-    1. Split on "|"
-    2. First segment is the keyword — always keep as anchor
-    3. Clean every subsequent segment with _clean_title
-    4. Near-duplicate deduplication:
-       a. Exact normalised match → skip
-       b. Token Jaccard ≥ 0.85 → skip (catches plural/minor variants)
-       c. One is ≤50% length of the other and contained within it → skip
-    5. Re-join with " | "
-
-    Returns at minimum just the keyword if all SERP segments are cleaned away.
-    """
-    if not text or not isinstance(text, str):
-        return keyword
-
-    parts = [p.strip() for p in text.split("|")]
-    if not parts:
-        return keyword
-
-    cleaned = [keyword]
-    seen_normalised = {_normalise_for_dedup(keyword)}
-    # Separate pool for trigram/substring dedup — excludes keyword itself
-    # (keyword is always short and would suppress legitimate longer titles
-    # e.g. "flow cytometry" would suppress "Flow Cytometry Applications")
-    dedup_pool = []
-
-    for part in parts[1:]:
-        c = _clean_title(part)
-        if c is None:
-            continue
-        norm = _normalise_for_dedup(c)
-
-        # a. Exact normalised match (checked against all including keyword)
-        if norm in seen_normalised:
-            continue
-
-        # b. High character trigram similarity against OTHER titles (not keyword)
-        # Threshold 0.85 Dice on trigrams catches "Inhibitor" vs "Inhibitors",
-        # rewording of the same phrase, etc. while preserving distinct angles.
-        if any(_char_trigram_sim(norm, s) >= 0.85 for s in dedup_pool if len(s) > 8):
-            continue
-
-        # c. Strict substring containment — one is trivially shorter than the other
-        if any(
-            (norm in s and len(norm) <= len(s) * 0.5)
-            or (s in norm and len(s) <= len(norm) * 0.5)
-            for s in dedup_pool
-            if len(s) > 8 and len(norm) > 8
-        ):
-            continue
-
-        cleaned.append(c)
-        seen_normalised.add(norm)
-        dedup_pool.append(norm)
-
-    return " | ".join(cleaned)
-
 
 
 def enrich_text(df: pd.DataFrame) -> pd.DataFrame:
@@ -4735,7 +4451,7 @@ def main():
     tc_df        = pd.DataFrame()
 
     # ── Stage 1
-    df = load_and_merge(args.keywords, args.serp, args.kw_col)
+    df = load_input(args.input, args.kw_col)
     _save_checkpoint(df, recs, args.output, "Stage 1 — merge")
 
     # ── Stage 2
@@ -4965,4 +4681,30 @@ if __name__ == "__main__":
 #   --min-cluster 3     min keywords per sub-topic cluster
 #   --top-n 9           show all 9 research areas in recommendations
 #   --kw-col query      if your keyword column has a different name
+# ═══════════════════════════════════════════════════════════════════════
+# INPUT FORMAT
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Single pre-joined CSV. Join your data before running.
+#
+# Columns:
+#   keyword            required
+#   impressions        required
+#   clicks             required
+#   enriched_text      required  pipe-separated SERP titles ("Title 1 | Title 2 | ...")
+#   all_paa_questions  optional  pipe-separated PAA questions
+#   snippet            optional  featured snippet text
+#   aio_snippet        optional  AI Overview snippet text
+#
+# position is not required — defaults to 999 (unranked) for all rows.
+# Gap analysis will classify everything as absence gaps.
+#
+# Run:
+#   python lifesci_gap_pipeline.py --input joined.csv --output ./results
+#
+# Flags:
+#   --threshold 0.20    min cosine similarity to assign a research area
+#   --min-cluster 3     min keywords per cluster
+#   --top-n 20          research areas in recommendations
+#   --kw-col query      if keyword column has a different name
 # ═══════════════════════════════════════════════════════════════════════
