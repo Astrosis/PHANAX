@@ -3472,8 +3472,11 @@ def mine_serp_title_gaps(df: pd.DataFrame, output_dir: str,
     )
     # Encode area descriptions with the same MiniLM model used for titles
     # — similarity scores are only valid when both vectors come from the same model
+    # Prefix with "minilm:" so cache key is distinct from Stage 3 PubMedBERT area embeddings
+    # (same texts, different model — without this the wrong cached embeddings get loaded)
     area_emb_s10 = cached_encode(
-        [a["description"] for a in RESEARCH_AREAS], stage10_model, _EMB_CACHE_DIR,
+        ["minilm: " + a["description"] for a in RESEARCH_AREAS],
+        stage10_model, _EMB_CACHE_DIR,
         label="research areas stage10 (MiniLM)",
         batch_size=256,
         show_progress_bar=False,
@@ -4644,202 +4647,269 @@ def generate_visibility_html(wins_df: pd.DataFrame, fresh_df: pd.DataFrame,
     return "\n".join(sections)
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.output, exist_ok=True)
-
-    # ── Embedding cache directory (shared across all stages)
-    global _EMB_CACHE_DIR
-    _EMB_CACHE_DIR = args.output
-
-    # ── Stage 1: Load & merge
-    df = load_and_merge(args.keywords, args.serp, args.kw_col)
-
-    # ── Stage 2: Enrich text
-    df = enrich_text(df)
-
-    # ── Stage 3: Embed
-    kw_emb, area_emb, model = embed_all(df, args.output)
-
-    # ── Stage 4: Research area mapping
-    df = map_research_areas(df, kw_emb, area_emb, args.threshold)
-
-    # ── Stage 5: Title-first clustering + AIO clustering
-    df, titles_df = cluster_keywords(df, kw_emb, args.min_cluster, model)
-
-    # ── Stage 6: Competitor landscape
-    df = analyze_competitor_landscape(df)
-
-    # ── Stage 7: Gap analysis
-    df = analyze_gaps(df)
-
-    # ── Stage 8: Score & recommend
-    area_df, recs = score_and_recommend(df, args.top_n)
-
-    # ── Stage 9: Content briefs (per-area clustering, relevance-gated)
-    briefs_df   = generate_content_briefs(
-        df, kw_emb, area_emb, model, recs, args.output, n_briefs=50
-    )
-    # HTML view: top 25 only (full 50 in content_briefs.csv)
-    briefs_html = generate_briefs_html(briefs_df.head(25), args.output,
-                                        total_briefs=len(briefs_df))
-
-    # ── Stage 10: SERP title mining — content angle gaps (relevance-gated)
-    serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
-        df, args.output, model, area_emb, n_gaps=50
-    )
-
-    # ── Stage 11: Search intent classification
-    df = run_intent_classification(df, model=model)
-
-    # ── Stage 12: Page 2 fast wins
-    wins_df = find_page2_fast_wins(df, args.output)
-
-    # ── Stage 13: Freshness priority
-    fresh_df = score_freshness_priority(df, args.output)
-
-    # ── Stage 14: Topic cluster mapper
-    tc_df = map_topic_clusters(df, kw_emb, args.output)
-
-    # ── Visibility HTML (stages 11-14)
-    visibility_html = generate_visibility_html(
-        wins_df   if len(wins_df)  > 0 else pd.DataFrame(),
-        fresh_df  if len(fresh_df) > 0 else pd.DataFrame(),
-        tc_df     if len(tc_df)    > 0 else pd.DataFrame(),
-        df,
-    )
-
-    # ── Save outputs
-    # Drop internal/noise columns from clusters.csv:
-    # - enriched_text: large embedding input text, not useful post-pipeline
-    # - gap_absence/performance/format/snippet: binary flags replaced by
-    #   primary_gap + gap_score; keeping them just creates confusion
-    # - academic_lock/serp_diversity: noisy intermediate metrics
-    # - winnability: replaced by paa_coverage in opportunity scoring
+def _save_checkpoint(df, recs, output_dir, label, kw_emb=None,
+                     titles_df=None, briefs_df=None, serp_gaps_df=None,
+                     wins_df=None, fresh_df=None, tc_df=None):
+    """Save whatever we have so far. Called after every stage."""
     drop_cols = [
         "enriched_text",
         "gap_absence", "gap_performance", "gap_format", "gap_snippet",
         "academic_lock", "serp_diversity", "winnability",
     ]
-    clusters_path           = os.path.join(args.output, "clusters.csv")
-    gaps_path               = os.path.join(args.output, "gaps.csv")
-    recs_path               = os.path.join(args.output, "recommendations.csv")
-    briefs_path             = os.path.join(args.output, "content_briefs.csv")
-    serp_gaps_path          = os.path.join(args.output, "serp_content_gaps.csv")
-    wins_path               = os.path.join(args.output, "page2_fast_wins.csv")
-    fresh_path              = os.path.join(args.output, "freshness_priority.csv")
-    tc_path                 = os.path.join(args.output, "topic_clusters.csv")
-    title_cluster_map_path  = os.path.join(args.output, "title_cluster_map.csv")
-    title_kw_map_path       = os.path.join(args.output, "keyword_map_title_clusters.csv")
-    aio_kw_map_path         = os.path.join(args.output, "keyword_map_aio_clusters.csv")
+    print(f"\n    💾 Checkpoint [{label}] saving outputs...")
 
-    # ── Keyword map 1: Title clusters
-    # One row per keyword. Shows every title cluster the keyword belongs to,
-    # ordered by title position (primary = highest-ranked title's cluster).
-    # Useful for: understanding what topics Google associates with each keyword,
-    # mapping keywords to content briefs, identifying multi-topic keywords.
-    title_kw_map = df[[
-        "keyword", "research_area", "impressions", "position",
-        "primary_cluster_id", "primary_cluster_label",
-        "cluster_ids", "cluster_labels",
-    ]].copy()
-    title_kw_map.columns = [
-        "keyword", "research_area", "impressions", "position",
-        "primary_title_cluster_id", "primary_title_cluster_label",
-        "all_title_cluster_ids", "all_title_cluster_labels",
-    ]
-    title_kw_map["cluster_count"] = (
-        title_kw_map["all_title_cluster_ids"]
-        .str.count(r"\|\|")
-        .add(1)
-        .where(title_kw_map["all_title_cluster_ids"].str.strip() != "", 0)
-    )
-    title_kw_map = title_kw_map.sort_values(
-        ["research_area", "impressions"], ascending=[True, False]
-    )
-    title_kw_map.to_csv(title_kw_map_path, index=False)
-    print(f"    → keyword_map_title_clusters.csv: {len(title_kw_map):,} keywords")
+    # clusters.csv — always save if we have df
+    if df is not None and len(df) > 0:
+        df.drop(columns=drop_cols, errors="ignore").to_csv(
+            os.path.join(output_dir, "clusters.csv"), index=False)
+        print(f"       clusters.csv ({len(df):,} rows)")
 
-    # ── Keyword map 2: AIO clusters
-    # Only keywords that have AI Overview data.
-    # One row per keyword. Shows primary AIO cluster and all AIO clusters
-    # if the keyword's snippets span multiple themes.
-    # Useful for: understanding what Google synthesises for each topic,
-    # identifying where AI Overviews are displacing organic clicks,
-    # finding AIO-specific content angles.
-    aio_cols_present = [c for c in [
-        "keyword", "research_area", "impressions", "position",
-        "aio_cluster_id", "aio_cluster_label",
-        "aio_cluster_ids", "aio_cluster_labels",
-    ] if c in df.columns]
+    # recommendations.csv
+    if recs is not None and len(recs) > 0:
+        recs.to_csv(os.path.join(output_dir, "recommendations.csv"))
+        print(f"       recommendations.csv ({len(recs):,} rows)")
 
-    if len(aio_cols_present) > 4:   # has AIO columns
-        aio_kw_map = df[aio_cols_present].copy()
-        aio_kw_map = aio_kw_map[
-            aio_kw_map.get("aio_cluster_id", pd.Series(-1, index=aio_kw_map.index)) >= 0
-        ]
-        if len(aio_kw_map) > 0:
-            aio_kw_map["aio_cluster_count"] = (
-                aio_kw_map.get("aio_cluster_ids", pd.Series("", index=aio_kw_map.index))
-                .str.count(r"\|\|")
-                .add(1)
-            )
-            aio_kw_map = aio_kw_map.sort_values(
-                ["research_area", "impressions"], ascending=[True, False]
-            )
-            aio_kw_map.to_csv(aio_kw_map_path, index=False)
-            print(f"    → keyword_map_aio_clusters.csv: {len(aio_kw_map):,} keywords with AIO data")
-        else:
-            print("    → keyword_map_aio_clusters.csv: no AIO data present")
-    else:
-        print("    → keyword_map_aio_clusters.csv: skipped (no AIO columns)")
+    # gaps.csv
+    if df is not None and "primary_gap" in df.columns and "gap_score" in df.columns:
+        gap_cols = [c for c in [
+            "keyword", "research_area", "primary_cluster_label",
+            "cluster_labels", "primary_gap", "gap_score",
+            "paa_questions", "impressions", "clicks", "position",
+        ] if c in df.columns]
+        gaps = df[(df["primary_gap"] != "None") & (df["gap_score"] >= 0.15)][gap_cols]
+        if len(gaps) > 0:
+            gaps.sort_values("gap_score", ascending=False).to_csv(
+                os.path.join(output_dir, "gaps.csv"), index=False)
+            print(f"       gaps.csv ({len(gaps):,} rows)")
 
-    # ── Save title-level cluster mapping (full detail: one row per title)
+    # content_briefs.csv
+    if briefs_df is not None and len(briefs_df) > 0:
+        briefs_df.to_csv(os.path.join(output_dir, "content_briefs.csv"))
+        print(f"       content_briefs.csv ({len(briefs_df):,} rows)")
+
+    # serp_content_gaps.csv
+    if serp_gaps_df is not None and len(serp_gaps_df) > 0:
+        serp_gaps_df.to_csv(os.path.join(output_dir, "serp_content_gaps.csv"))
+        print(f"       serp_content_gaps.csv ({len(serp_gaps_df):,} rows)")
+
+    # title cluster map
     if titles_df is not None and len(titles_df) > 0:
         titles_df[["title", "keyword", "cluster_id", "cluster_label"]].to_csv(
-            title_cluster_map_path, index=False
+            os.path.join(output_dir, "title_cluster_map.csv"), index=False)
+        print(f"       title_cluster_map.csv ({len(titles_df):,} rows)")
+
+    # page2 wins
+    if wins_df is not None and len(wins_df) > 0:
+        wins_df.to_csv(os.path.join(output_dir, "page2_fast_wins.csv"))
+        print(f"       page2_fast_wins.csv ({len(wins_df):,} rows)")
+
+    # freshness
+    if fresh_df is not None and len(fresh_df) > 0:
+        fresh_df.to_csv(os.path.join(output_dir, "freshness_priority.csv"))
+        print(f"       freshness_priority.csv ({len(fresh_df):,} rows)")
+
+    # topic clusters
+    if tc_df is not None and len(tc_df) > 0:
+        tc_df.to_csv(os.path.join(output_dir, "topic_clusters.csv"))
+        print(f"       topic_clusters.csv ({len(tc_df):,} rows)")
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output, exist_ok=True)
+
+    global _EMB_CACHE_DIR
+    _EMB_CACHE_DIR = args.output
+
+    # Shared state — populated incrementally
+    df           = None
+    kw_emb       = None
+    area_emb     = None
+    model        = None
+    titles_df    = None
+    recs         = pd.DataFrame()
+    briefs_df    = pd.DataFrame()
+    serp_gaps_df = pd.DataFrame()
+    wins_df      = pd.DataFrame()
+    fresh_df     = pd.DataFrame()
+    tc_df        = pd.DataFrame()
+
+    # ── Stage 1
+    df = load_and_merge(args.keywords, args.serp, args.kw_col)
+    _save_checkpoint(df, recs, args.output, "Stage 1 — merge")
+
+    # ── Stage 2
+    df = enrich_text(df)
+    _save_checkpoint(df, recs, args.output, "Stage 2 — enrich")
+
+    # ── Stage 3
+    kw_emb, area_emb, model = embed_all(df, args.output)
+    kw_emb_full = kw_emb  # preserve full-length copy for stages 11-14
+
+    # ── Stage 4
+    df = map_research_areas(df, kw_emb, area_emb, args.threshold)
+    _save_checkpoint(df, recs, args.output, "Stage 4 — research areas")
+
+    # ── Stage 5
+    df, titles_df = cluster_keywords(df, kw_emb, args.min_cluster, model)
+    _save_checkpoint(df, recs, args.output, "Stage 5 — clustering",
+                     titles_df=titles_df)
+
+    # ── Stage 6
+    df = analyze_competitor_landscape(df)
+
+    # ── Stage 7
+    df = analyze_gaps(df)
+    _save_checkpoint(df, recs, args.output, "Stage 7 — gap analysis",
+                     titles_df=titles_df)
+
+    # ── Stage 8
+    area_df, recs = score_and_recommend(df, args.top_n)
+    _save_checkpoint(df, recs, args.output, "Stage 8 — scoring",
+                     titles_df=titles_df)
+
+    # ── Stage 9
+    try:
+        briefs_df = generate_content_briefs(
+            df, kw_emb, area_emb, model, recs, args.output, n_briefs=50
         )
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 9 failed: {e}")
+        print("       Continuing — saving what we have so far...")
+        briefs_df = pd.DataFrame()
+    _save_checkpoint(df, recs, args.output, "Stage 9 — briefs",
+                     titles_df=titles_df, briefs_df=briefs_df)
 
-    df.drop(columns=drop_cols, errors="ignore").to_csv(clusters_path, index=False)
+    # ── Stage 10
+    try:
+        serp_gaps_df, serp_gaps_html = mine_serp_title_gaps(
+            df, args.output, model, area_emb, n_gaps=50
+        )
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 10 failed: {e}")
+        serp_gaps_df   = pd.DataFrame()
+        serp_gaps_html = ""
+    _save_checkpoint(df, recs, args.output, "Stage 10 — SERP gaps",
+                     titles_df=titles_df, briefs_df=briefs_df,
+                     serp_gaps_df=serp_gaps_df)
 
-    gap_cols = ["keyword", "research_area", "research_area_2",
-                "primary_cluster_id", "primary_cluster_label",
-                "cluster_ids", "cluster_labels",
-                "aio_cluster_id", "aio_cluster_label",
-                "aio_cluster_ids", "aio_cluster_labels",
-                "cluster_label",
-                "primary_gap", "gap_score",
-                "gap_paa", "paa_questions",
-                "impressions", "clicks", "position", "ctr",
-                "dominant_format"]
-    gap_cols = [c for c in gap_cols if c in df.columns]
-    (
-        df[(df["primary_gap"] != "None") & (df["gap_score"] >= 0.15)][gap_cols]
-        .sort_values("gap_score", ascending=False)
-        .to_csv(gaps_path, index=False)
-    )
+    # ── Stage 11
+    try:
+        df = run_intent_classification(df, model=model)
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 11 failed: {e}")
 
-    recs.to_csv(recs_path)
-    generate_report(df, recs, args.output,
-                    kw_emb=kw_emb,
-                    briefs_html=briefs_html,
-                    serp_gaps_html=serp_gaps_html,
-                    visibility_html=visibility_html)
+    # ── Stage 12
+    try:
+        wins_df = find_page2_fast_wins(df, args.output)
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 12 failed: {e}")
+        wins_df = pd.DataFrame()
 
+    # ── Stage 13
+    try:
+        fresh_df = score_freshness_priority(df, args.output)
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 13 failed: {e}")
+        fresh_df = pd.DataFrame()
+
+    # ── Stage 14
+    try:
+        tc_df = map_topic_clusters(df, kw_emb_full, args.output)
+    except Exception as e:
+        print(f"\n    ⚠️  Stage 14 failed: {e}")
+        tc_df = pd.DataFrame()
+
+    _save_checkpoint(df, recs, args.output, "Final",
+                     titles_df=titles_df, briefs_df=briefs_df,
+                     serp_gaps_df=serp_gaps_df, wins_df=wins_df,
+                     fresh_df=fresh_df, tc_df=tc_df)
+
+    # ── Keyword maps (title + AIO) — save as part of final checkpoint
+    title_kw_map_path  = os.path.join(args.output, "keyword_map_title_clusters.csv")
+    aio_kw_map_path    = os.path.join(args.output, "keyword_map_aio_clusters.csv")
+    title_cluster_map_path = os.path.join(args.output, "title_cluster_map.csv")
+
+    try:
+        title_kw_map = df[[
+            "keyword", "research_area", "impressions", "position",
+            "primary_cluster_id", "primary_cluster_label",
+            "cluster_ids", "cluster_labels",
+        ]].copy()
+        title_kw_map.columns = [
+            "keyword", "research_area", "impressions", "position",
+            "primary_title_cluster_id", "primary_title_cluster_label",
+            "all_title_cluster_ids", "all_title_cluster_labels",
+        ]
+        title_kw_map["cluster_count"] = (
+            title_kw_map["all_title_cluster_ids"]
+            .str.count(r"\|\|").add(1)
+            .where(title_kw_map["all_title_cluster_ids"].str.strip() != "", 0)
+        )
+        title_kw_map.sort_values(
+            ["research_area", "impressions"], ascending=[True, False]
+        ).to_csv(title_kw_map_path, index=False)
+        print(f"    → keyword_map_title_clusters.csv: {len(title_kw_map):,} keywords")
+    except Exception as e:
+        print(f"    ⚠️  keyword_map_title_clusters skipped: {e}")
+
+    try:
+        aio_cols_present = [c for c in [
+            "keyword", "research_area", "impressions", "position",
+            "aio_cluster_id", "aio_cluster_label",
+            "aio_cluster_ids", "aio_cluster_labels",
+        ] if c in df.columns]
+        if len(aio_cols_present) > 4:
+            aio_kw_map = df[aio_cols_present].copy()
+            aio_kw_map = aio_kw_map[
+                aio_kw_map.get("aio_cluster_id", pd.Series(-1, index=aio_kw_map.index)) >= 0
+            ]
+            if len(aio_kw_map) > 0:
+                aio_kw_map.to_csv(aio_kw_map_path, index=False)
+                print(f"    → keyword_map_aio_clusters.csv: {len(aio_kw_map):,} rows")
+    except Exception as e:
+        print(f"    ⚠️  keyword_map_aio_clusters skipped: {e}")
+
+    if titles_df is not None and len(titles_df) > 0:
+        try:
+            titles_df[["title", "keyword", "cluster_id", "cluster_label"]].to_csv(
+                title_cluster_map_path, index=False)
+        except Exception as e:
+            print(f"    ⚠️  title_cluster_map skipped: {e}")
+
+    # ── HTML report (best-effort — don't crash if something is missing)
+    try:
+        briefs_html     = generate_briefs_html(
+            briefs_df.head(25) if len(briefs_df) > 0 else pd.DataFrame(),
+            args.output, total_briefs=len(briefs_df))
+        serp_gaps_html  = serp_gaps_df.to_html() if len(serp_gaps_df) > 0 else ""
+        visibility_html = generate_visibility_html(
+            wins_df  if len(wins_df)  > 0 else pd.DataFrame(),
+            fresh_df if len(fresh_df) > 0 else pd.DataFrame(),
+            tc_df    if len(tc_df)    > 0 else pd.DataFrame(),
+            df,
+        )
+        generate_report(df, recs, args.output,
+                        kw_emb=kw_emb,
+                        briefs_html=briefs_html,
+                        serp_gaps_html=serp_gaps_html,
+                        visibility_html=visibility_html)
+    except Exception as e:
+        print(f"    ⚠️  HTML report skipped: {e}")
+
+    o = args.output
     print("\n" + "═" * 62)
     print("✅  Pipeline complete!")
-    print(f"   clusters.csv                    → {clusters_path}")
-    print(f"   title_cluster_map.csv           → {title_cluster_map_path}")
-    print(f"   keyword_map_title_clusters.csv  → {title_kw_map_path}")
-    print(f"   keyword_map_aio_clusters.csv    → {aio_kw_map_path}")
-    print(f"   gaps.csv                        → {gaps_path}")
-    print(f"   recommendations.csv             → {recs_path}")
-    print(f"   content_briefs.csv              → {briefs_path}")
-    print(f"   serp_content_gaps.csv           → {serp_gaps_path}")
-    print(f"   page2_fast_wins.csv             → {wins_path}")
-    print(f"   freshness_priority.csv          → {fresh_path}")
-    print(f"   topic_clusters.csv              → {tc_path}")
-    print(f"   report.html                     → {os.path.join(args.output, 'report.html')}")
+    for fname in [
+        "clusters.csv", "title_cluster_map.csv",
+        "keyword_map_title_clusters.csv", "keyword_map_aio_clusters.csv",
+        "gaps.csv", "recommendations.csv", "content_briefs.csv",
+        "serp_content_gaps.csv", "page2_fast_wins.csv",
+        "freshness_priority.csv", "topic_clusters.csv", "report.html",
+    ]:
+        p = os.path.join(o, fname)
+        if os.path.exists(p):
+            print(f"   ✓ {fname}")
     print("═" * 62)
 
     print("\n📋  Top Research Area Recommendations:\n")
