@@ -620,127 +620,45 @@ def apply_keyword_filter(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame
 
 
 def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
-    """
-    Load and merge keyword + SERP files. JOIN FIRST, CLEAN SECOND.
-
-    Both files come from the same source table — impressions/clicks/position
-    live in the keywords file. The SERP file contributes title_N, paa_N,
-    snippet and other SERP columns only.
-
-    Steps:
-      1. Load both files raw (dtype=str)
-      2. Standardise column names
-      3. Build case-insensitive join key
-      4. Aggregate SERP to one row per keyword (handles multi-row title files)
-      5. Drop any metric columns from SERP — metrics come from kw only
-      6. Left join kw → serp on join key
-      7. Normalise keyword values + coerce numerics
-      8. Apply quality filters
-    """
     print("\n[1/10] Loading and merging inputs...")
 
-    # ── 1. Load raw
+    # Load both files exactly as-is
     kw   = pd.read_csv(kw_path,   dtype=str)
     serp = pd.read_csv(serp_path, dtype=str)
 
-    # ── 2. Standardise column names
+    # Standardise column names only
     kw.columns   = [c.strip().lower().replace(" ", "_") for c in kw.columns]
     serp.columns = [c.strip().lower().replace(" ", "_") for c in serp.columns]
 
-    # Rename keyword column in kw file
+    # Ensure keyword column is named "keyword" in both
     kw_col_norm = kw_col.strip().lower().replace(" ", "_")
     if kw_col_norm not in kw.columns:
-        raise ValueError(
-            f"Column '{kw_col}' not found in keywords file. "
-            f"Available: {list(kw.columns)}"
-        )
+        raise ValueError(f"Column '{kw_col}' not found. Available: {list(kw.columns)}")
     kw = kw.rename(columns={kw_col_norm: "keyword"})
 
-    # Rename keyword column in SERP file
     for candidate in ("keyword", "query", "search_term", "term"):
         if candidate in serp.columns:
             serp = serp.rename(columns={candidate: "keyword"})
             break
     if "keyword" not in serp.columns:
-        raise ValueError(
-            f"No keyword column found in SERP file. "
-            f"Available: {list(serp.columns)}"
-        )
+        raise ValueError(f"No keyword column in SERP file. Available: {list(serp.columns)}")
 
-    print(f"    → {len(kw):,} kw rows | {len(serp):,} SERP rows (raw)")
+    print(f"    → {len(kw):,} kw rows | {len(serp):,} SERP rows")
 
-    # ── 3. Case-insensitive join key
-    kw["_join_key"]   = kw["keyword"].str.strip().str.lower()
-    serp["_join_key"] = serp["keyword"].str.strip().str.lower()
+    # LEFT JOIN — kw is left, all kw rows kept, SERP columns added
+    # Join on lowercased keyword to match Excel vlookup behaviour
+    kw["_k"]   = kw["keyword"].str.strip().str.lower()
+    serp["_k"] = serp["keyword"].str.strip().str.lower()
 
-    # ── 4. Strip ALL metric columns from SERP before aggregating
-    # Metrics (impressions, clicks, position, ctr, volume) always come from
-    # the kw file. Removing them from SERP prevents any conflict or overwrite.
-    METRIC_COLS = {"impressions", "clicks", "position", "ctr", "volume",
-                   "click_through_rate", "avg_position", "average_position"}
-    serp_metric_cols = [c for c in serp.columns if c in METRIC_COLS]
-    if serp_metric_cols:
-        print(f"    → Dropping metric cols from SERP (come from kw file): {serp_metric_cols}")
-        serp = serp.drop(columns=serp_metric_cols)
+    # SERP: one row per keyword, drop its keyword col to avoid conflicts
+    serp_dedup = (serp.drop(columns=["keyword"])
+                      .drop_duplicates("_k")
+                      .reset_index(drop=True))
 
-    # ── 5. Deduplicate SERP to one row per keyword
-    # SERP file may have multiple rows per keyword (one per title position).
-    # Keep first occurrence for non-metric columns.
-    serp_clean = serp.drop_duplicates("_join_key").reset_index(drop=True)
-    print(f"    → {len(serp_clean):,} unique SERP keywords after dedup")
+    df = kw.merge(serp_dedup, on="_k", how="left")
+    df = df.drop(columns=["_k"], errors="ignore")
 
-    # ── 6. Diagnose overlap
-    kw_keys   = set(kw["_join_key"])
-    serp_keys = set(serp_clean["_join_key"])
-    overlap   = kw_keys & serp_keys
-    kw_only   = kw_keys - serp_keys
-
-    print(f"\n    Join diagnostics:")
-    print(f"      ✓ {len(overlap):,}  match ({len(overlap)/max(len(kw_keys),1)*100:.1f}%)")
-    print(f"      ✗ {len(kw_only):,}  kw-only (no SERP titles — still have metrics)")
-    print(f"      ~ {len(serp_keys-kw_keys):,}  SERP-only (not in kw file — skipped)")
-
-    if len(overlap) == 0:
-        print(f"\n    ⚠️  WARNING: Zero overlap")
-        print(f"      KW sample:   {list(kw['_join_key'])[:5]}")
-        print(f"      SERP sample: {list(serp_clean['_join_key'])[:5]}")
-    elif len(overlap) < len(kw_keys) * 0.5:
-        print(f"\n    ⚠️  Low match rate")
-        print(f"      KW sample:   {list(kw['_join_key'])[:3]}")
-        print(f"      SERP sample: {list(serp_clean['_join_key'])[:3]}")
-
-    # ── 7. Left join — kw is left, all kw rows preserved
-    # Drop keyword col from SERP to avoid _x/_y on it
-    serp_join = serp_clean.drop(columns=["keyword"], errors="ignore")
-    df = kw.merge(serp_join, on="_join_key", how="left")
-    df = df.drop(columns=["_join_key"], errors="ignore")
-
-    # Resolve any remaining _x/_y — always prefer kw-side
-    for col in list({c.replace("_x", "") for c in df.columns if c.endswith("_x")}):
-        if f"{col}_x" in df.columns:
-            df[col] = df[f"{col}_x"]
-            df = df.drop(columns=[f"{col}_x", f"{col}_y"], errors="ignore")
-
-    # ── 8. Normalise keyword values after join
-    df["keyword_raw"] = df["keyword"].copy()
-    df["keyword"]     = df["keyword"].apply(_normalise_keyword)
-    df = df.drop_duplicates("keyword").reset_index(drop=True)
-
-    # ── 9. Coerce numeric columns
-    # Diagnose impressions BEFORE coercion — shows exactly what's in the raw file
-    if "impressions" in df.columns:
-        raw_imp = df["impressions"]
-        n_null    = raw_imp.isna().sum()
-        n_zero    = (raw_imp == "0").sum()
-        n_empty   = (raw_imp == "").sum()
-        n_nonzero = raw_imp.apply(lambda x: str(x).strip() not in ("", "0", "nan", "None")).sum()
-        print(f"\n    Raw impressions diagnostic (before coercion):")
-        print(f"      non-zero values : {n_nonzero:,}")
-        print(f"      null/NaN        : {n_null:,}")
-        print(f"      literal '0'     : {n_zero:,}")
-        print(f"      empty string    : {n_empty:,}")
-        print(f"      sample values   : {raw_imp.head(10).tolist()}")
-
+    # Coerce numeric columns
     for col, default in [("impressions", 0), ("clicks", 0),
                           ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
         if col in df.columns:
@@ -748,26 +666,21 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         else:
             df[col] = default
 
-    # ── 10. Apply keyword quality filters
+    # Normalise keyword values and apply filters
+    df["keyword_raw"] = df["keyword"].copy()
+    df["keyword"]     = df["keyword"].apply(_normalise_keyword)
+    df = df.drop_duplicates("keyword").reset_index(drop=True)
+
     print("    → Applying keyword filters...")
     df = apply_keyword_filter(df, verbose=True)
 
-    # ── Summary
     with_imp  = (df["impressions"] > 0).sum()
-    has_title = any(c in df.columns for c in ("title_1", "enriched_text"))
-    with_serp = df["title_1"].notna().sum() if "title_1" in df.columns else \
-                df["enriched_text"].str.contains(r"\|", na=False).sum() \
-                if "enriched_text" in df.columns else 0
+    with_serp = df["enriched_text"].notna().sum() if "enriched_text" in df.columns else \
+                df["title_1"].notna().sum() if "title_1" in df.columns else 0
 
     print(f"\n    → {len(df):,} keywords after merge + filter")
-    print(f"    → {with_imp:,} ({with_imp/max(len(df),1)*100:.1f}%) with impressions > 0")
-    print(f"    → {with_serp:,} with SERP title data")
-
-    if with_imp < len(df) * 0.3:
-        print(f"\n    ⚠️  >70% missing impressions.")
-        print(f"      Check that your kw file actually has an impressions column")
-        print(f"      with non-zero values. Columns found: {list(df.columns[:10])}")
-        print(f"      Sample: {df[['keyword','impressions']].head(5).to_string()}")
+    print(f"    → {with_imp:,} with impressions > 0")
+    print(f"    → {with_serp:,} with SERP data")
 
     return df
 
