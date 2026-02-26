@@ -605,6 +605,12 @@ def apply_keyword_filter(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame
     if verbose and len(removed) > 0:
         reason_counts = reasons[filtered_mask].value_counts()
         print(f"    → Filtered {len(removed):,} keywords ({before - len(removed):,} remain)")
+        # Show how many impression-bearing keywords were filtered
+        if "impressions" in removed.columns:
+            imp_lost = (removed["impressions"] > 0).sum()
+            if imp_lost > 0:
+                print(f"    → ⚠️  {imp_lost:,} filtered keywords had impressions > 0")
+                print(f"         sample: {removed[removed['impressions']>0]['keyword'].head(5).tolist()}")
         print("    → Filter breakdown:")
         for reason, count in reason_counts.head(10).items():
             print(f"         {count:>5}  {reason}")
@@ -2894,11 +2900,13 @@ def generate_content_briefs(df: pd.DataFrame, kw_emb: np.ndarray,
         _HAVE_HDBSCAN = False
 
     # Only classified, meaningfully gapped keywords
-    work = df[
+    work_mask = (
         (df["research_area"] != "Unclassified / General Methods") &
         (df["gap_score"] >= 0.15) &
         (df["keyword"].apply(_is_valid_label))
-    ].copy()
+    )
+    work    = df[work_mask].copy().reset_index(drop=True)
+    kw_emb  = kw_emb[work_mask.values]   # slice embeddings to match work rows
 
     if len(work) == 0:
         print("    → No valid gap keywords above threshold")
