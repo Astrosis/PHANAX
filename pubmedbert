@@ -622,43 +622,24 @@ def apply_keyword_filter(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame
 def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
     print("\n[1/10] Loading and merging inputs...")
 
-    # Load both files exactly as-is
-    kw   = pd.read_csv(kw_path,   dtype=str)
-    serp = pd.read_csv(serp_path, dtype=str)
+    # Step 1: load both CSVs as-is
+    kw   = pd.read_csv(kw_path)
+    serp = pd.read_csv(serp_path)
 
-    # Standardise column names only
-    kw.columns   = [c.strip().lower().replace(" ", "_") for c in kw.columns]
-    serp.columns = [c.strip().lower().replace(" ", "_") for c in serp.columns]
+    # Step 2: merge immediately — nothing else happens first
+    df = pd.merge(kw, serp, on=kw_col, how="left")
 
-    # Ensure keyword column is named "keyword" in both
+    print(f"    → {len(kw):,} kw rows | {len(serp):,} SERP rows | {len(df):,} after merge")
+
+    # Step 3: standardise column names
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Step 4: rename keyword column if needed
     kw_col_norm = kw_col.strip().lower().replace(" ", "_")
-    if kw_col_norm not in kw.columns:
-        raise ValueError(f"Column '{kw_col}' not found. Available: {list(kw.columns)}")
-    kw = kw.rename(columns={kw_col_norm: "keyword"})
+    if kw_col_norm != "keyword" and kw_col_norm in df.columns:
+        df = df.rename(columns={kw_col_norm: "keyword"})
 
-    for candidate in ("keyword", "query", "search_term", "term"):
-        if candidate in serp.columns:
-            serp = serp.rename(columns={candidate: "keyword"})
-            break
-    if "keyword" not in serp.columns:
-        raise ValueError(f"No keyword column in SERP file. Available: {list(serp.columns)}")
-
-    print(f"    → {len(kw):,} kw rows | {len(serp):,} SERP rows")
-
-    # LEFT JOIN — kw is left, all kw rows kept, SERP columns added
-    # Join on lowercased keyword to match Excel vlookup behaviour
-    kw["_k"]   = kw["keyword"].str.strip().str.lower()
-    serp["_k"] = serp["keyword"].str.strip().str.lower()
-
-    # SERP: one row per keyword, drop its keyword col to avoid conflicts
-    serp_dedup = (serp.drop(columns=["keyword"])
-                      .drop_duplicates("_k")
-                      .reset_index(drop=True))
-
-    df = kw.merge(serp_dedup, on="_k", how="left")
-    df = df.drop(columns=["_k"], errors="ignore")
-
-    # Coerce numeric columns
+    # Step 5: coerce numeric columns
     for col, default in [("impressions", 0), ("clicks", 0),
                           ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
         if col in df.columns:
@@ -666,7 +647,7 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
         else:
             df[col] = default
 
-    # Normalise keyword values and apply filters
+    # Step 6: normalise keyword and apply filters
     df["keyword_raw"] = df["keyword"].copy()
     df["keyword"]     = df["keyword"].apply(_normalise_keyword)
     df = df.drop_duplicates("keyword").reset_index(drop=True)
@@ -678,7 +659,7 @@ def load_and_merge(kw_path: str, serp_path: str, kw_col: str) -> pd.DataFrame:
     with_serp = df["enriched_text"].notna().sum() if "enriched_text" in df.columns else \
                 df["title_1"].notna().sum() if "title_1" in df.columns else 0
 
-    print(f"\n    → {len(df):,} keywords after merge + filter")
+    print(f"    → {len(df):,} keywords after filter")
     print(f"    → {with_imp:,} with impressions > 0")
     print(f"    → {with_serp:,} with SERP data")
 
