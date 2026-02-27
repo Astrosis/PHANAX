@@ -644,9 +644,15 @@ def load_input(input_path: str, kw_col: str = "keyword") -> pd.DataFrame:
     for col, default in [("impressions", 0), ("clicks", 0),
                           ("position", 999.0), ("volume", 0), ("ctr", 0.0)]:
         if col in df.columns:
+            # Strip commas from numbers like "1,234" before coercion
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str).str.replace(",", "", regex=False)
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
         else:
             df[col] = default
+
+    print(f"    \u2192 impressions: max={df['impressions'].max()}, "
+          f"non-zero={(df['impressions'] > 0).sum():,}/{len(df):,} rows")
 
     # Normalise keyword text
     df["keyword_raw"] = df["keyword"].copy()
@@ -1456,12 +1462,25 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
         .to_dict()
     )
 
+    # Pre-encode all unique cluster labels once for semantic primary selection
+    unique_labels = list({c[1] for clusters in kw_clusters.values() for c in clusters
+                          if c[1] and c[1] != "Unknown"})
+    if unique_labels:
+        label_embs = cached_encode(
+            unique_labels, model, _EMB_CACHE_DIR,
+            label="cluster labels (primary selection)", batch_size=64,
+            show_progress_bar=False,
+        )
+        label_emb_map = {lbl: emb for lbl, emb in zip(unique_labels, label_embs)}
+    else:
+        label_emb_map = {}
+
     primary_id_list    = []
     primary_label_list = []
     all_ids_list       = []
     all_labels_list    = []
 
-    for _, row in df.iterrows():
+    for i, row in df.iterrows():
         clusters = kw_clusters.get(row["keyword"], [])
         if not clusters:
             primary_id_list.append(-1)
@@ -1469,12 +1488,31 @@ def cluster_keywords(df: pd.DataFrame, kw_emb: np.ndarray,
             all_ids_list.append("")
             all_labels_list.append("")
             continue
-        ids    = [str(c[0]) for c in clusters]
+        ids       = [str(c[0]) for c in clusters]
         labels_kw = [c[1] for c in clusters]
-        primary_id_list.append(int(ids[0]))
-        primary_label_list.append(labels_kw[0])
         all_ids_list.append(" || ".join(ids))
         all_labels_list.append(" || ".join(labels_kw))
+
+        # Pick the cluster label most semantically similar to the keyword itself
+        if label_emb_map and i < len(kw_emb):
+            kw_vec = kw_emb[i]
+            best_idx, best_sim = 0, -1.0
+            for j, lbl in enumerate(labels_kw):
+                if lbl in label_emb_map:
+                    sim = float(np.dot(kw_vec, label_emb_map[lbl]))
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_idx = j
+            primary_id_list.append(int(ids[best_idx]))
+            primary_label_list.append(labels_kw[best_idx])
+        else:
+            # Fallback: use most frequent cluster across all keywords
+            from collections import Counter
+            freq = Counter(labels_kw)
+            best_label = freq.most_common(1)[0][0]
+            best_idx   = labels_kw.index(best_label)
+            primary_id_list.append(int(ids[best_idx]))
+            primary_label_list.append(best_label)
 
     df["primary_cluster_id"]    = primary_id_list
     df["primary_cluster_label"] = primary_label_list
